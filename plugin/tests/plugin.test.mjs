@@ -644,8 +644,3 @@ async function withBridgeEnv(dir, fn) {
 await fsp.rm(tmpRoot, { recursive: true, force: true })
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) process.exitCode = 1
-
-
-
-
-
