@@ -352,6 +352,22 @@ const fakeExec = { agent: { model: { current: () => ({ provider: 'fake', model: 
 }
 
 // ── 10. R1/R2 竞态、消费一次即作废、junction TOCTOU ─────────────────────────
+const resetStatus = typeof T.resetStatusStateForTest === 'function'
+  ? T.resetStatusStateForTest
+  : () => {}
+
+const refreshStatus = typeof T.refreshPluginStatus === 'function'
+  ? T.refreshPluginStatus
+  : async () => ({ ok: false })
+
+async function readJsonIfExists(file) {
+  try {
+    return JSON.parse(await fsp.readFile(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
 const resetPublish = typeof T.resetPublishStateForTest === 'function'
   ? T.resetPublishStateForTest
   : () => {}
@@ -639,6 +655,176 @@ async function withBridgeEnv(dir, fn) {
   ok('reason chars capped', chars <= 280, String(chars))
   ok('reason bytes capped', bytes <= 1024, String(bytes))
   ok('reason not empty after truncation', chars > 0 && bytes > 0, `${chars}/${bytes}`)
+}
+
+// ── 12. draft.5：decision.session_id + plugin_status.json ────────────────────
+{
+  // 启动/恢复路径：没有决策时也能写出 ready 状态。
+  resetStatus()
+  const initial = await refreshStatus({ bridgeDir })
+  eq('initial status write ok', initial.ok, true)
+  const status = (await readJsonIfExists(path.join(bridgeDir, 'plugin_status.json'))) ?? { x_runtime: {} }
+  eq('initial status ready', status.status, 'ready')
+  eq('initial status error null', status.error_code, null)
+  eq('initial status bridge dir', status.x_runtime.bridge_dir, bridgeDir)
+}
+
+{
+  resetStatus()
+  resetPublish()
+  const state = freshState()
+  state.session_id = 's-test-0001'
+  state.request_id = 'r-session-0001'
+  const result = await T.runIsaacDecide({
+    config: { bridgeDir },
+    ctx: fakeLlmCtx([{ text: '{"item_id":22,"reason":"回显 session","confidence":0.9}' }]),
+    args: { state },
+    exec: fakeExec,
+  })
+  const decision = JSON.parse(await fsp.readFile(path.join(bridgeDir, 'decision.json'), 'utf8'))
+  eq('decision echoes session_id', decision.session_id, 's-test-0001')
+  eq('tool result echoes session_id', result.session_id, 's-test-0001')
+
+  const statusPath = path.join(bridgeDir, 'plugin_status.json')
+  const statusRaw = await fsp.readFile(statusPath, 'utf8').catch(() => '')
+  const status = statusRaw ? JSON.parse(statusRaw) : { x_runtime: {} }
+  eq('status ready', status.status, 'ready')
+  eq('status protocol version', status.protocol_version, '1.0')
+  eq('status plugin version', status.plugin_version, T.PLUGIN_VERSION)
+  eq('status available', status.x_runtime.available, true)
+  eq('status current model provider', (status.x_runtime.current_model ?? {}).provider, 'fake')
+  eq('status current model', (status.x_runtime.current_model ?? {}).model, 'fake-1')
+  eq('status bridge dir', status.x_runtime.bridge_dir, bridgeDir)
+  eq('status lock held', status.x_runtime.lock_held, false)
+  eq(
+    'status error counts all five',
+    JSON.stringify(status.x_runtime.error_code_counts),
+    JSON.stringify({ IO: 0, TIMEOUT: 0, VALIDATION: 0, MODEL: 0, INTERNAL: 0 }),
+  )
+  ok('status last success set', Number.isFinite(status.x_runtime.last_success_ts), String(status.x_runtime.last_success_ts))
+  ok('status size <= 8KiB', Buffer.byteLength(statusRaw, 'utf8') <= 8192, String(Buffer.byteLength(statusRaw, 'utf8')))
+  ok('status contains no secret', !/sk-|Bearer|api[_-]?key/i.test(statusRaw))
+  const statusTmp = (await fsp.readdir(bridgeDir)).filter((name) => name.includes('.tmp.'))
+  eq('status no tmp leftovers', statusTmp.length, 0)
+}
+
+{
+  // 跨 major：不写 decision，但 plugin_status 明确 refused/version_major。
+  resetStatus()
+  resetPublish()
+  const state = freshState()
+  state.protocol_version = '2.0'
+  state.request_id = 'r-status-major-01'
+  const result = await T.runIsaacDecide({
+    config: { bridgeDir },
+    ctx: fakeLlmCtx([{ text: '{"item_id":22}' }]),
+    args: { state },
+    exec: fakeExec,
+  })
+  eq('major mismatch not written', result.written, false)
+  const status = (await readJsonIfExists(path.join(bridgeDir, 'plugin_status.json'))) ?? { x_runtime: {} }
+  eq('major mismatch status refused', status.status, 'refused')
+  eq('major mismatch status error', status.error_code, 'VALIDATION')
+  eq('major mismatch status reason', status.reason_code, 'version_major')
+  eq('major mismatch status unavailable', status.x_runtime.available, false)
+}
+
+{
+  // state 没有 session_id：按协议降级为“不写 decision + status refused/missing_field”。
+  resetStatus()
+  resetPublish()
+  const state = freshState()
+  state.request_id = 'r-session-missing-01'
+  delete state.session_id
+  const validation = T.validateStateDoc(state)
+  eq('missing session_id fatal', validation.fatal, true)
+  eq('missing session_id reason', validation.reasonCode, 'missing_field')
+  const result = await T.runIsaacDecide({
+    config: { bridgeDir },
+    ctx: fakeLlmCtx([{ text: '{"item_id":22}' }]),
+    args: { state },
+    exec: fakeExec,
+  })
+  eq('missing session_id not written', result.written, false)
+  eq('missing session_id ok=false', result.ok, false)
+  const status = (await readJsonIfExists(path.join(bridgeDir, 'plugin_status.json'))) ?? { x_runtime: {} }
+  eq('missing session status refused', status.status, 'refused')
+  eq('missing session status error', status.error_code, 'VALIDATION')
+  eq('missing session status reason', status.reason_code, 'missing_field')
+  eq('missing session status unavailable', status.x_runtime.available, false)
+
+  const bad = freshState()
+  bad.session_id = 'short'
+  eq('invalid session id format rejected', T.validateStateDoc(bad).reasonCode, 'missing_field')
+}
+
+{
+  // 模型失败兜底：status=degraded，记录 MODEL 计数；后续成功恢复 ready。
+  resetStatus()
+  resetPublish()
+  const state = freshState()
+  state.request_id = 'r-status-fallback-01'
+  const fallbackResult = await T.runIsaacDecide({
+    config: { bridgeDir },
+    ctx: fakeLlmCtx(['bad', 'still bad']),
+    args: { state },
+    exec: fakeExec,
+  })
+  eq('status fallback result', fallbackResult.fallback, true)
+  let status = (await readJsonIfExists(path.join(bridgeDir, 'plugin_status.json')))
+    ?? { x_runtime: { error_code_counts: {} } }
+  eq('status degraded after fallback', status.status, 'degraded')
+  eq('status degraded error', status.error_code, 'MODEL')
+  eq('status degraded reason', status.reason_code, 'model_error')
+  eq('status degraded count', status.x_runtime.error_code_counts.MODEL, 1)
+  eq('status degraded available', status.x_runtime.available, true)
+
+  const recovered = freshState()
+  recovered.request_id = 'r-status-recover-01'
+  await T.runIsaacDecide({
+    config: { bridgeDir },
+    ctx: fakeLlmCtx([{ text: '{"item_id":22,"reason":"恢复","confidence":0.9}' }]),
+    args: { state: recovered },
+    exec: fakeExec,
+  })
+  status = (await readJsonIfExists(path.join(bridgeDir, 'plugin_status.json')))
+    ?? { x_runtime: { error_code_counts: {} } }
+  eq('status ready after recovery', status.status, 'ready')
+  eq('status recovery clears error', status.error_code, null)
+  eq('status recovery keeps historical count', status.x_runtime.error_code_counts.MODEL, 1)
+  ok('status recovery last success', Number.isFinite(status.x_runtime.last_success_ts), String(status.x_runtime.last_success_ts))
+}
+
+{
+  // decision 自检必须拒绝 session_id 不一致。
+  const state = freshState()
+  const draft = T.normalizeDraft({ item_id: 22, confidence: 0.8 }, state.state)
+  const doc = T.makeDecisionDoc(state, draft, {
+    source: 'llm',
+    providerId: 'llm:primary',
+    fallback: false,
+  })
+  doc.session_id = 's-other-0001'
+  let threw = false
+  if (typeof T.assertDecisionLegal === 'function') {
+    try {
+      T.assertDecisionLegal(doc, state)
+    } catch {
+      threw = true
+    }
+  }
+  eq('decision session mismatch rejected', threw, true)
+}
+
+{
+  // 状态文件仍受白名单约束：只允许三个固定文件名。
+  let code = null
+  try {
+    await T.safeFilePath(bridgeDir, 'plugin_status.json.bak')
+  } catch (error) {
+    code = error.reasonCode
+  }
+  eq('unsafe status filename rejected', code, 'io_error')
 }
 
 await fsp.rm(tmpRoot, { recursive: true, force: true })

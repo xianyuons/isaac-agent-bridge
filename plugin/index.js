@@ -39,6 +39,8 @@ const PROTOCOL_MAJOR = 1
 const DEFAULT_BRIDGE_DIR_NAME = 'IsaacAgent'
 const STATE_FILE = 'state.json'
 const DECISION_FILE = 'decision.json'
+const PLUGIN_STATUS_FILE = 'plugin_status.json'
+const BRIDGE_FILES = new Set([STATE_FILE, DECISION_FILE, PLUGIN_STATUS_FILE])
 
 const STALE_AFTER_MS = 30_000
 const DEFAULT_VALIDITY_MS = 1500
@@ -46,6 +48,7 @@ const WRITE_MARGIN_MS = 200
 const MIN_ATTEMPT_MS = 250
 const MAX_STATE_BYTES = 256 * 1024
 const MAX_DECISION_BYTES = 8 * 1024
+const MAX_STATUS_BYTES = 8 * 1024
 const MAX_CANDIDATES = 64
 const MAX_ITEMS = 1024
 const MAX_REASON_CHARS = 280
@@ -64,6 +67,7 @@ const ACTION_WHITELIST = new Set(['skip'])
 const PLUGIN_CAPABILITIES = new Set(['transport:file_read', 'transport:file_write'])
 
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,64}$/
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{8,64}$/
 const DECISION_ID_RE = /^[A-Za-z0-9_-]{8,64}$/
 const GEN_LEVEL_KEY_RE = /^[A-Za-z0-9_.:-]{1,128}$/
 const PROTOCOL_VERSION_RE = /^\d+\.\d+(\.\d+)?$/
@@ -225,9 +229,9 @@ async function resolveBridgeDir(config) {
   return dir
 }
 
-/** 只允许读/写桥目录下固定名称的两个文件，拒绝符号链接目标。 */
+/** 只允许读/写桥目录下固定名称的三个文件，拒绝符号链接目标。 */
 async function safeFilePath(bridgeDir, name) {
-  if (name !== STATE_FILE && name !== DECISION_FILE) {
+  if (!BRIDGE_FILES.has(name)) {
     throw new IsaacError('VALIDATION', 'io_error', '非法的桥文件名称')
   }
   const dir = path.resolve(bridgeDir)
@@ -368,14 +372,16 @@ function serializeDecision(doc) {
   return json
 }
 
-/** 已在写锁内：不再获取锁，直接做真实目录校验 + 原子替换。 */
-async function writeDecisionLocked(bridgeDir, doc) {
-  const json = serializeDecision(doc)
+/**
+ * 已在写锁内：不再获取锁，直接做真实目录校验 + 通用原子替换。
+ * `fileName` 只能来自 BRIDGE_FILES，调用方负责 JSON 大小上限。
+ */
+async function writeJsonLocked(bridgeDir, fileName, json) {
   const realDir = await ensureRealBridgeDir(bridgeDir)
-  const file = await safeFilePath(realDir, DECISION_FILE)
+  const file = await safeFilePath(realDir, fileName)
   const tmp = path.join(
     realDir,
-    `${DECISION_FILE}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`,
+    `${fileName}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`,
   )
 
   let handle
@@ -396,7 +402,7 @@ async function writeDecisionLocked(bridgeDir, doc) {
     handle = undefined
     await fsp.rm(cleanupPath, { force: true }).catch(() => undefined)
     if (error instanceof IsaacError) throw error
-    throw new IsaacError('IO', 'io_error', '写 decision.json 临时文件失败（旧文件保持不动）')
+    throw new IsaacError('IO', 'io_error', `写 ${fileName} 临时文件失败（旧文件保持不动）`)
   }
   if (handle) await handle.close().catch(() => undefined)
 
@@ -420,14 +426,28 @@ async function writeDecisionLocked(bridgeDir, doc) {
     await renameWithRetry(tmp, file)
   } catch {
     await fsp.rm(cleanupPath, { force: true }).catch(() => undefined)
-    throw new IsaacError('IO', 'io_error', '替换 decision.json 失败（旧文件保持不动）')
+    throw new IsaacError('IO', 'io_error', `替换 ${fileName} 失败（旧文件保持不动）`)
   }
 
-  return { bytes: byteLength(json), file: DECISION_FILE, dir: realDir }
+  return { bytes: byteLength(json), file: fileName, dir: realDir }
+}
+
+/** 已在写锁内：decision.json 的序列化 + 大小上限 + 原子写。 */
+async function writeDecisionLocked(bridgeDir, doc) {
+  return writeJsonLocked(bridgeDir, DECISION_FILE, serializeDecision(doc))
 }
 
 async function writeDecisionAtomic(bridgeDir, doc) {
   return withWriteLock(() => writeDecisionLocked(bridgeDir, doc))
+}
+
+/** plugin_status.json 也是插件写、mod/QA 读；同样走真实目录校验与原子替换。 */
+async function writePluginStatusAtomic(bridgeDir, doc) {
+  const json = JSON.stringify(doc)
+  if (byteLength(json) > MAX_STATUS_BYTES) {
+    throw new IsaacError('VALIDATION', 'out_of_range', `plugin_status.json 超过 ${MAX_STATUS_BYTES} 字节上限`)
+  }
+  return withWriteLock(() => writeJsonLocked(bridgeDir, PLUGIN_STATUS_FILE, json))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -587,6 +607,7 @@ function discardedResult(state, gate, meta) {
     written: false,
     discarded: true,
     discard_reason: gate.discardReason,
+    session_id: state.session_id,
     request_id: state.request_id,
     gen_level_key: state.gen_level_key,
     error_code: gate.errorCode,
@@ -613,6 +634,128 @@ async function publishDecision({ bridgeDir, state, stateSource, doc, ctx, requir
     publishState.consumed.set(state.request_id, Date.now())
     return { written: true, ...written }
   })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// plugin_status.json（draft.5 §1.11；可选诊断，插件写、mod/QA 读）
+// ─────────────────────────────────────────────────────────────────────────────
+
+const statusState = {
+  status: 'ready',
+  errorCode: null,
+  reasonCode: null,
+  detail: null,
+  model: null,
+  lastSuccessTs: null,
+  lastFailureTs: null,
+  errorCounts: { IO: 0, TIMEOUT: 0, VALIDATION: 0, MODEL: 0, INTERNAL: 0 },
+  bridgeDir: null,
+  lockHeld: false,
+}
+
+function resetStatusStateForTest() {
+  statusState.status = 'ready'
+  statusState.errorCode = null
+  statusState.reasonCode = null
+  statusState.detail = null
+  statusState.model = null
+  statusState.lastSuccessTs = null
+  statusState.lastFailureTs = null
+  for (const code of ERROR_CODES) statusState.errorCounts[code] = 0
+  statusState.bridgeDir = null
+  statusState.lockHeld = false
+}
+
+function setStatusModel(model) {
+  if (model && isNonEmptyString(model.provider) && isNonEmptyString(model.model)) {
+    statusState.model = { provider: model.provider, model: model.model }
+  }
+}
+
+function markStatusSuccess() {
+  statusState.status = 'ready'
+  statusState.errorCode = null
+  statusState.reasonCode = null
+  statusState.detail = null
+  statusState.lastSuccessTs = Date.now()
+}
+
+function markStatusFailure(errorCode, reasonCode, { refused = false } = {}) {
+  const code = ERROR_CODES.has(errorCode) ? errorCode : 'INTERNAL'
+  statusState.status = refused ? 'refused' : 'degraded'
+  statusState.errorCode = code
+  statusState.reasonCode = typeof reasonCode === 'string' && reasonCode.length > 0 ? reasonCode : 'internal_error'
+  // detail 不写路径/密钥/弹幕，只写机器可读原因，避免把桥目录等本地信息带出去。
+  statusState.detail = `last: ${statusState.reasonCode}`
+  statusState.lastFailureTs = Date.now()
+  statusState.errorCounts[code] += 1
+}
+
+function buildPluginStatusDoc() {
+  return {
+    protocol_version: PROTOCOL_VERSION,
+    plugin_version: PLUGIN_VERSION,
+    ts: Date.now(),
+    status: statusState.status,
+    error_code: statusState.errorCode,
+    reason_code: statusState.reasonCode,
+    detail: statusState.detail,
+    // draft.5 §1.7：厂商扩展一律 x_ 前缀；这里放任务要求的运行状态。
+    x_runtime: {
+      available: statusState.status !== 'refused',
+      current_model: statusState.model
+        ? { provider: statusState.model.provider, model: statusState.model.model }
+        : null,
+      last_success_ts: statusState.lastSuccessTs,
+      last_failure_ts: statusState.lastFailureTs,
+      error_code_counts: { ...statusState.errorCounts },
+      bridge_dir: statusState.bridgeDir,
+      lock_held: statusState.lockHeld,
+      lock_mode: 'process-local',
+    },
+  }
+}
+
+/** 写一次 plugin_status.json；失败只记在返回值里，绝不影响决策路径。 */
+async function refreshPluginStatus(config, bridgeDirOverride) {
+  try {
+    const bridgeDir = bridgeDirOverride ?? await resolveBridgeDir(config)
+    statusState.bridgeDir = bridgeDir
+    await writePluginStatusAtomic(bridgeDir, buildPluginStatusDoc())
+    return { ok: true, file: PLUGIN_STATUS_FILE, bridgeDir }
+  } catch (error) {
+    return {
+      ok: false,
+      error_code: error instanceof IsaacError ? error.errorCode : 'INTERNAL',
+      reason_code: error instanceof IsaacError ? error.reasonCode : 'internal_error',
+      message: error?.message ?? String(error),
+    }
+  }
+}
+
+/** 根据一次工具结果更新内存状态，并尽力落盘 plugin_status.json。 */
+async function noteToolResult(config, result, { bridgeDir, model } = {}) {
+  if (bridgeDir) statusState.bridgeDir = bridgeDir
+  setStatusModel(model)
+
+  if (result?.ok && result.written === true) {
+    if (result.valid === false) {
+      markStatusFailure(result.error_code ?? 'VALIDATION', result.reason_code, { refused: true })
+    } else if (result.fallback === true && result.error_code) {
+      markStatusFailure(result.error_code, result.reason_code, { refused: false })
+    } else {
+      // 正常 llm / 安全跳过（player_dead、no_candidate）都算健康。
+      markStatusSuccess()
+    }
+  } else if (result?.discarded === true) {
+    // 迟到/被更新请求取代不是插件故障；保持当前 status，只刷新 ts。
+  } else if (result && result.ok === false) {
+    const refused = result.error_code === 'VALIDATION'
+    markStatusFailure(result.error_code, result.reason_code, { refused })
+  }
+
+  const written = await refreshPluginStatus(config, statusState.bridgeDir)
+  return written
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -681,6 +824,10 @@ function validateStateDoc(doc) {
   const major = Number(version.split('.')[0])
   if (major !== PROTOCOL_MAJOR) {
     return fatal('version_major', `不支持的协议 major=${major}（本端只支持 ${PROTOCOL_MAJOR}）`)
+  }
+  // draft.5：session_id 必填；插件无法回显时不能静默写一份会被 mod 拒绝的 decision。
+  if (!isNonEmptyString(doc.session_id) || !SESSION_ID_RE.test(doc.session_id)) {
+    return fatal('missing_field', 'session_id 缺失或格式非法')
   }
   if (!isNonEmptyString(doc.request_id) || !REQUEST_ID_RE.test(doc.request_id)) {
     return fatal('missing_field', 'request_id 缺失或格式非法')
@@ -1200,6 +1347,9 @@ function assertDecisionLegal(doc, state) {
     throw new IsaacError('INTERNAL', 'internal_error', `内部决策自检失败：${message}`)
   }
 
+  if (!SESSION_ID_RE.test(doc.session_id) || doc.session_id !== state.session_id) {
+    fail('session_id 未回显 state.session_id')
+  }
   if (!REQUEST_ID_RE.test(doc.request_id) || !DECISION_ID_RE.test(doc.decision_id)) fail('request_id/decision_id 格式')
   if (!GEN_LEVEL_KEY_RE.test(doc.gen_level_key)) fail('gen_level_key 格式')
   if (doc.error_code !== null && !ERROR_CODES.has(doc.error_code)) fail('error_code')
@@ -1243,6 +1393,7 @@ function assertDecisionLegal(doc, state) {
 function makeDecisionDoc(state, draft, meta) {
   const doc = {
     protocol_version: PROTOCOL_VERSION,
+    session_id: state.session_id,
     request_id: state.request_id,
     decision_id: newDecisionId(),
     gen_level_key: state.gen_level_key,
@@ -1349,7 +1500,7 @@ function errorResult(error, context) {
 // 工具实现
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function runIsaacState({ config }) {
+async function runIsaacStateInner({ config }) {
   try {
     const bridgeDir = await resolveBridgeDir(config)
     const { doc, mtimeMs } = await readStateFile(bridgeDir)
@@ -1374,7 +1525,23 @@ async function runIsaacState({ config }) {
   }
 }
 
-async function runIsaacDecide({ config, ctx, args, exec }) {
+/** isaac_state 的公开入口：读完后刷新 plugin_status.json，但不改变工具结果。 */
+async function runIsaacState({ config }) {
+  const bridgeDir = await resolveBridgeDir(config).catch(() => null)
+  const result = await runIsaacStateInner({ config })
+  if (bridgeDir) statusState.bridgeDir = bridgeDir
+  if (result.ok) {
+    markStatusSuccess()
+  } else {
+    markStatusFailure(result.error_code, result.reason_code, {
+      refused: result.error_code === 'VALIDATION',
+    })
+  }
+  await refreshPluginStatus(config, bridgeDir ?? statusState.bridgeDir)
+  return result
+}
+
+async function runIsaacDecideInner({ config, ctx, args, exec }) {
   const startedAt = Date.now()
   const elapsed = () => Date.now() - startedAt
 
@@ -1385,6 +1552,7 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
 
   try {
     bridgeDir = await resolveBridgeDir(config)
+    statusState.bridgeDir = bridgeDir
 
     if (args?.state !== undefined) {
       stateSource = 'inline'
@@ -1458,6 +1626,7 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
         written: true,
         valid: false,
         decision_id: doc.decision_id,
+        session_id: doc.session_id,
         request_id: doc.request_id,
         choice: doc.decision.choice,
         reason: doc.decision.reason,
@@ -1504,6 +1673,7 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
         written: true,
         valid: true,
         decision_id: doc.decision_id,
+        session_id: doc.session_id,
         request_id: doc.request_id,
         choice: doc.decision.choice,
         reason: doc.decision.reason,
@@ -1563,6 +1733,7 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
         written: true,
         valid: true,
         decision_id: doc.decision_id,
+        session_id: doc.session_id,
         request_id: doc.request_id,
         choice: doc.decision.choice,
         reason: doc.decision.reason,
@@ -1595,6 +1766,7 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
   }
 
   const selection = resolveModelSelection(ctx, exec, config)
+  setStatusModel(selection)
   if (!selection) {
     return finishWithFallback({
       errorCode: 'MODEL',
@@ -1671,7 +1843,8 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
       written: true,
       valid: true,
       decision_id: doc.decision_id,
-      request_id: doc.request_id,
+      session_id: doc.session_id,
+        request_id: doc.request_id,
       choice: doc.decision.choice,
       reason: doc.decision.reason,
       source: doc.decision.source,
@@ -1689,6 +1862,13 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
     // 写盘失败必须显式：不谎报 llm 成功。
     return errorResult(error, '写 llm 决策失败')
   }
+}
+
+/** isaac_decide 公开入口：结果返回前刷新 plugin_status.json（失败不影响工具结果）。 */
+async function runIsaacDecide(args) {
+  const result = await runIsaacDecideInner(args)
+  await noteToolResult(args.config, result, { bridgeDir: statusState.bridgeDir })
+  return result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1728,6 +1908,9 @@ const DECIDE_OUTPUT = {
  */
 export function apply(root, config) {
   const pluginConfig = isPlainObject(config) ? config : {}
+
+  // 启动即写一次 plugin_status（尽力而为；失败不影响工具注册）。
+  void refreshPluginStatus(pluginConfig)
 
   root.inject(['tools'], (ctx) => {
     ctx.tools.register({
@@ -1806,14 +1989,21 @@ export const __testing = {
   STALE_AFTER_MS,
   MAX_STATE_BYTES,
   MAX_DECISION_BYTES,
+  MAX_STATUS_BYTES,
   MAX_REASON_BYTES,
   PLUGIN_CAPABILITIES,
+  PLUGIN_STATUS_FILE,
   resolveBridgeDir,
   safeFilePath,
   readStateFile,
   readTextWithRetry,
   writeDecisionAtomic,
+  writePluginStatusAtomic,
+  buildPluginStatusDoc,
+  refreshPluginStatus,
+  resetStatusStateForTest,
   ensureRealBridgeDir,
+  assertDecisionLegal,
   resetPublishStateForTest,
   registerRequest,
   evaluatePublishGate,
