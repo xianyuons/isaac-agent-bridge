@@ -36,19 +36,31 @@
 - 两维分开，才能保住“每次抽取恰好落一个分类”的不变量；否则每加一个 provider 就要动 `source` 枚举，历史 `applied.json` 的统计口径全部作废。
 - **误用警告**：实现方 **不得** 用 `provider_id` 判断“是否兜底”。兜底只看 `fallback` / `applied_by`；`provider_id` 只做来源标注与展示。
 
-### 0.2 English Summary (protocol v1.0-draft.3)
+### 0.2 English Summary (protocol v1.0-draft.5)
 
 This document defines the local file bridge between a REPENTOGON Lua mod (game side) and a
 DSH plugin (agent side) for *The Binding of Isaac: Repentance+*. The game only describes
 its situation; the agent only chooses from the game's candidate pool. Neither side may
 invent state or bypass the contract.
 
-**Documents and keys.** Four UTF-8, BOM-less, strict-JSON files live in one bridge
-directory (default `%LOCALAPPDATA%\IsaacAgent`): `state.json` (mod → plugin), `event.json`
-(mod → consumers, latest-wins notifications), `applied.json` (mod → consumers, the final
-outcome) and `decision.json` (plugin → mod). `request_id` correlates a state with its
-decision; `decision_id` identifies each decision for audit; `gen_level_key` pins both to one
-generation context so a stale room/floor choice can never be reused.
+**Profiles.** The default is **Profile B**: the plugin is the only writer, the mod never
+writes `state/event/applied` and only consumes `decision.json`. There is no live state
+export, so Profile B cannot run a real-time agent — it uses preset decisions or the local
+rule, and must say so instead of pretending the agent is available. **Profile A** is
+optional and requires launching the game with `--luadebug`, which grants filesystem access
+to *every* installed mod (a real, global risk, not a per-mod switch); only A exports state
+and can run the agent live. **Profile C** (SaveData relay) is deferred to v1.1+ and must
+not be claimed or used as a default.
+
+**Documents and keys.** UTF-8, BOM-less, strict-JSON files live in one bridge directory
+(default `%LOCALAPPDATA%\IsaacAgent`): `state.json` (mod → plugin, Profile A only),
+`event.json` (mod → consumers, latest-wins notifications, A only), `applied.json` (mod →
+consumers, the final outcome, A only), `decision.json` (plugin → mod, the one mandatory
+direction) and the optional diagnostic `plugin_status.json` (plugin → mod/QA).
+`session_id` identifies one game session and is echoed in decisions; `request_id`
+correlates a state with its decision; `decision_id` identifies each decision for audit;
+`gen_level_key` pins both to one generation context so a stale room/floor choice can never
+be reused.
 
 **Timing.** `validity_ms` (default 1500; 5000–10000 for boss-reward prefetch) is the
 decision's freshness window, *not* a blocking wait. The mod never sleeps or reads disk
@@ -91,8 +103,8 @@ callback 62.
 
 **Out of scope in v1.** No decision queue (one active generation target, latest-wins), no
 complete audit log (`applied.json` is the last receipt), no reliable event bus (file events
-may be lost), no real-time agent in a read-only profile, and no map/enemy export. See §11
-for the full list of known trade-offs and §10 for byte-stable examples.
+may be lost), no live agent in the default Profile B (no state export), and no map/enemy
+export. See §11 for the full list of known trade-offs and §10 for byte-stable examples.
 
 ---
 

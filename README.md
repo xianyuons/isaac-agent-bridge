@@ -13,10 +13,11 @@ in DSH's credential store. The bridge is plain UTF-8 JSON on local disk, with no
 access from the mod.
 
 > **Status: offline-verified, not smoke-tested on a real game install.**
-> The Lua logic is covered by 74 offline assertions, the plugin by 68 offline assertions,
-> and the JSON contract by `tools/mock_e2e.py` (4 scenarios / 52 assertions). The author's
-> machine does not have REPENTOGON installed, so **no end-to-end run inside the actual
-> game has been performed yet**. Treat this as a working prototype, not a polished release.
+> Contract: `docs/protocol.md` **v1.0-draft.5** (wire version `1.0`). The Lua logic is
+> covered by 74 offline assertions, the plugin by 68 offline assertions, and the JSON
+> contract by `tools/mock_e2e.py` (4 scenarios / 52 assertions). The author's machine does
+> not have REPENTOGON installed, so **no end-to-end run inside the actual game has been
+> performed yet**. Treat this as a working prototype, not a polished release.
 
 ---
 
@@ -35,23 +36,31 @@ access from the mod.
 └──────────────────────────┘
 ```
 
-1. When a room is entered (and again while waiting for a generation), the mod exports
-   the run: player, items, room/floor/boss, and the **candidate pool** (max 64 ids).
-2. The DSH plugin reads that state, calls the model once with the candidate ids, validates
-   the answer against the protocol, and atomically writes `decision.json`.
+1. **Profile A only:** when a room is entered (and again while waiting for a generation),
+   the mod exports the run: player, items, room/floor/boss, and the **candidate pool**
+   (max 64 ids). Profile B has no live export by design.
+2. The DSH plugin reads that state (or receives a full `StateDoc` inline), calls the model
+   once with the candidate ids, validates the answer against the protocol, and atomically
+   writes `decision.json`.
 3. At item generation time the mod looks in memory for a still-fresh decision for the
    current `gen_level_key`. If there is one, it returns that `item_id` from callback 62.
    Otherwise it applies the same deterministic local rule as the plugin
    (heal when out of red hearts → damage when the run has no damage item → first
    candidate) and records the fallback.
-4. `applied.json` records what actually happened (`applied_by: llm | provider | fallback |
-   none`), so you never have to guess whether the agent or the fallback won.
+4. `applied.json` (Profile A) records what actually happened (`applied_by: llm | provider |
+   fallback | none`), so you never have to guess whether the agent or the fallback won. In
+   Profile B the same evidence goes to the bubble and the plugin's `plugin_status.json`.
 
 `1500 ms` (or `5000–10000 ms` for boss-reward prefetch) is the **validity window of a
 decision**, not a blocking wait. The mod never sleeps or polls inside a game callback.
 
 Full contract: [docs/protocol.md](docs/protocol.md). Architecture and extension points:
 [docs/architecture.md](docs/architecture.md).
+
+**Chat / Bilibili danmaku** is designed but offline-only in v1: see
+[docs/danmaku.md](docs/danmaku.md). It is off by default, opens no live connection, stores
+no usernames or message text, and only contributes four aggregate tendency numbers to the
+prompt — it never bypasses the candidate pool or the fallback path.
 
 ### Relationship to the reference implementation
 
@@ -70,29 +79,35 @@ The protocol defines three transport profiles (`docs/protocol.md` §1.4):
 
 | Profile | Who writes | Who reads | Status in this repo |
 | --- | --- | --- | --- |
-| **A** | mod writes `state/event/applied`, plugin writes `decision` | both sides | implemented; requires file I/O in the Lua sandbox |
-| **B** | plugin writes `decision` only; mod never writes | mod reads `decision` | intended fallback shape; also requires file **read** access |
-| **C** | SaveData relay | plugin reads the save data | research only, disabled by default, **not implemented** |
+| **B (default)** | plugin writes `decision` (and optional `plugin_status`); mod never writes `state/event/applied` | mod reads `decision` | product default; **no live state export**, so preset decisions or local rules only |
+| **A (optional)** | mod writes `state/event/applied`, plugin writes `decision` | both sides | implemented; requires file I/O in the Lua sandbox (`--luadebug`) |
+| **C (deferred)** | SaveData relay | plugin-side feeder | v1.1+, **not implemented**, must not be claimed |
 
-### Default install: local rules, no launch flags
+### Default install: Profile B, no launch flags
 
 **Write ownership is one-way.** The DSH plugin is the only writer of `decision.json`; the
-mod never writes a decision. In Profile B the mod writes *nothing at all* — it only reads
-`decision.json` — and in Profile A it additionally writes `state/event/applied` for
-diagnostics. So even the fallback shape has no "mod writes a fake decision" path.
+mod never writes a decision and, in Profile B, never writes any state file either. Profile B
+is the default product shape: the player does not need to change any launch option, and the
+mod only consumes `decision.json`.
 
-With no special launch options, the Isaac Lua sandbox exposes **neither `io` nor `os`** —
-not even for reading. The mod probes this at `on_game_start` and switches to its
-**local-rule fallback**: it still picks intelligently (heal / damage / first candidate),
-prints a bubble that says `桥接不可用（本地规则）` ("bridge unavailable — local rules"),
-and never pretends the agent is available. Nothing is written to disk, nothing is read
-from disk, and the game cannot break because a file is missing.
+Because Profile B has no live state export, it **cannot run the agent on the current run**:
+
+- a **preset decision** written/queued on the DSH side, or
+- the **local rule** (heal / damage / first candidate), with a bubble that says
+  `桥接不可用（本地规则）` ("bridge unavailable — local rules"),
+- or a full `StateDoc` supplied to `isaac_decide` from outside the game (not a live export).
+
+It must never pretend the agent is available, and it never waits forever: if no decision is
+present at generation time, the local rule applies. Note that on a stock Isaac sandbox even
+**reading** `decision.json` needs `io`; when the probe finds no file access, the mod degrades
+to the same local rule (with the same bubble) and writes nothing.
 
 ### Profile A: the full bridge (optional, with a real security cost)
 
-To let the mod write `state.json` and read `decision.json`, the game must be launched with
-**`--luadebug`** (Steam → The Binding of Isaac → Properties → Launch Options), or you must
-run on a REPENTOGON build that exposes file APIs directly.
+Profile A is the only profile that can run the agent on the live run. To let the mod write
+`state.json` and read `decision.json`, the game must be launched with **`--luadebug`**
+(Steam → The Binding of Isaac → Properties → Launch Options), or you must run on a
+REPENTOGON build that exposes file APIs directly.
 
 > **`--luadebug` opens `io`/`os` file access for *every* installed mod, not just this one.**
 > Any mod you have enabled can then read and write files inside your user profile.
@@ -209,14 +224,17 @@ and validates the answer; it does not run an agent loop.
 
 ### 5. Verify
 
-With the game running and a run loaded (**Profile A only** — in the default no-flag
-profile there is intentionally no `state.json`):
+With the game running and a run loaded (**Profile A only** — the default Profile B has no
+live `state.json` by design):
 
 ```text
 # in DSH, ask the agent to call:
 isaac_state          → should return the parsed state.json, mtime, and stale=false
 isaac_decide         → should write decision.json and return a choice
 ```
+
+In Profile B, call `isaac_decide` with an explicit `state` object, or pre-place a valid
+`decision.json`; `isaac_state` will have nothing live to read.
 
 Check `%LOCALAPPDATA%\IsaacAgent\` for `state.json` and `decision.json`. If `state.json`
 never appears, see Troubleshooting.
@@ -266,6 +284,10 @@ $env:ISAAC_AGENT_LUA = "53"; python tests/run_lua_test.py   # game-like runtime
 
 # 2) end-to-end JSON contract — 4 scenarios, 52 assertions
 python tools/mock_e2e.py
+
+# 3) danmaku/viewer-tendency offline simulator (fixed fixture, no network)
+python tools/danmaku_sim.py
+python -m unittest discover -s tools/tests -p "test_*.py"
 ```
 
 `tools/mock_e2e.py` simulates the game side (writes `state.json`), drives the real
@@ -273,6 +295,10 @@ python tools/mock_e2e.py
 against `docs/protocol.md` for four cases: valid state, missing field, out-of-pool item id,
 and expired state. It prints a per-assertion PASS/FAIL and a four-scenario conclusion;
 exit code 0 means everything passed.
+
+`tools/danmaku_sim.py` runs the fixed 32-message fixture through filtering and aggregation
+and prints the four tendency weights; it never opens a network connection and never writes
+viewer text to disk. See [docs/danmaku.md](docs/danmaku.md).
 
 The 68-assertion plugin unit suite used during development lives outside this repository
 (temporary harness); it is not part of the shipped tree.
@@ -288,12 +314,15 @@ docs/
   standards.md         # coding rules and team process
   lessons.md           # pitfalls hit by the team
   reference-notes.md   # study of the reference implementation (concept only)
+  danmaku.md           # Bilibili danmaku/viewer-tendency design (offline only, default off)
   reviews/             # third-party protocol review
 mods/isaac_agent/      # game side: state export, decision consumer, local rules
 plugin/                # DSH side: isaac_state / isaac_decide
 protocol/examples/     # three byte-stable snapshots (success / fallback / timeout)
 tests/                 # Lua logic tests + runner
 tools/mock_e2e.py      # offline mod↔plugin contract test
+tools/danmaku_sim.py   # offline viewer-tendency simulator (fixed fixture, no network)
+tools/tests/           # danmaku simulator unit tests
 ```
 
 ## Security and red lines
@@ -337,25 +366,24 @@ examples and both implementations, then run the offline tests above.
 **API key 只存在于 DSH 的凭据存储里**：游戏侧、mod、桥目录、日志、`reason` 文本都不
 会出现 key。游戏侧不联网，只读写本地 JSON。
 
-## 两种形态（安装前必读）
+## 两种形态（安装前必读，协议 §1.4）
 
-**写入口径是单向的**：`decision.json` 只由 DSH 插件写，mod 永远不写决策。Profile B 里
-mod 什么都不写、只读 `decision.json`；Profile A 里 mod 额外写 `state/event/applied`
-用于诊断与回执。任何形态下都不存在"mod 自己编一份 decision"的路径。
+**写入口径是单向的**：`decision.json` 只由 DSH 插件写，mod 永远不写决策。**默认是
+Profile B**：mod 不写 `state/event/applied`，只读 `decision.json`；玩家不需要改任何
+启动项。Profile A 是可选增强（mod 额外写 `state/event/applied`，只有它能实时跑 agent）；
+Profile C（SaveData 中继）推迟到 v1.1+，v1 不实现、也不得声称支持。
 
-- **默认形态（不加任何启动项）**：以撒的 Lua 沙箱不提供 `io`/`os`，连读文件都不行。
-  mod 启动探针会检测到这一点，自动走**本地规则兜底**（没红心先回血 → 没输出先补伤害 →
-  否则取第一个候选），气泡明确提示 `桥接不可用（本地规则）`，并如实标成兜底。这个形态
-  不需要 DSH 也能玩，不会因为文件缺失卡住或报错。
+- **默认 Profile B（不加任何启动项）**：没有实时 state 导出，所以**不能拿当前这局实时
+  问模型**，只能用预置决策、本地规则，或由外部把完整 StateDoc 交给 `isaac_decide`
+  （不是游戏内实时导出）。没决策时走**本地规则兜底**（没红心先回血 → 没输出先补伤害 →
+  否则取第一个候选），气泡明确提示 `桥接不可用（本地规则）`，并如实标成兜底。
+  另外，原生以撒沙箱连读 `decision.json` 所需的 `io` 都没有；探针失败时 mod 同样退本地
+  规则、不写任何文件，不会因为文件缺失卡住或报错。
 - **Profile A（可选增强）**：给以撒加 `--luadebug` 启动参数后，mod 才能写 `state.json`
-  并读 `decision.json`，agent 决策链路才真正生效。
+  并读 `decision.json`，实时 agent 链路才真正生效。
   ⚠️ **`--luadebug` 会放开所有 mod 的文件访问权限，不是零风险开关。** 只在你信任 mods
   目录里每一个 mod 时开启，用完可以移除。mod 自己的路径白名单/不联网/不碰 key 约束不了
   *别的* mod。
-
-协议里的 Profile B（插件写、mod 只读）是设计上的"不写盘"形态，但读文件同样需要文件
-访问能力；在原生沙箱里没有这个能力，所以本版把"没有文件能力"直接当作本地规则处理，
-不假装 agent 可用。Profile C（SaveData 中继）只做研究，默认关闭，本版未实现。
 
 **没装 REPENTOGON 会怎样**：mod 把 REPENTOGON 声明为硬依赖（回调注册/时序都依赖它）。
 在原生 Repentance+ 加载器下它可能加载失败或钩子行为不对；这种配置不受支持，也没有
@@ -379,6 +407,8 @@ mod 什么都不写、只读 `decision.json`；Profile A 里 mod 额外写 `stat
 ```powershell
 python tests/run_lua_test.py     # Lua 逻辑 74 条断言
 python tools/mock_e2e.py         # 四种场景的 mock 联调，52 条断言
+python tools/danmaku_sim.py      # 弹幕倾向离线模拟（固定 32 条样例，不联网）
+python -m unittest discover -s tools/tests -p "test_*.py"
 ```
 
 ## 现实边界（如实说明）
@@ -387,6 +417,8 @@ python tools/mock_e2e.py         # 四种场景的 mock 联调，52 条断言
   全部来自离线测试与 mock。第一次实机安装请先看游戏日志与气泡提示。
 - `applied.json` / `event.json` 是 latest-wins 回执，不是完整审计日志。
 - 同一时刻只服务一个生成目标；多底座房间、快速 reroll 会走本地规则，详见协议 §11。
+- B 站弹幕/聊天只做到**设计与离线模拟**（`docs/danmaku.md`），默认关闭，未接真实直播间、
+  不读 cookie、不落盘弹幕原文；它只产生提示词里的观众倾向，不改变候选池与兜底路径。
 
 ## 与参考实现的关系
 
