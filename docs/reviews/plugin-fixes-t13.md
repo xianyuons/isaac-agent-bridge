@@ -195,7 +195,7 @@ npm --prefix plugin test
 
 ## 7. t18/t19 后续：draft.5 字段补齐
 
-t18 补齐 `decision.session_id` 回显与 `plugin_status.json`；t19 又修正了本文件 D2/D4/D6 的过度收紧。测试现为 **182 项**（原 111 + t18 46 + t19 25）。完整「已实现/未实现」清单见 [draft5-plugin-fields.md](draft5-plugin-fields.md)。本文件 §1 的 D1–D6 已按 §8 更新。
+t18 补齐 `decision.session_id` 回显与 `plugin_status.json`；t19 修正本文件 D2/D4/D6 的过度收紧；t22 补 M1/M4/M6。测试现为 **218 项**（原 111 + t18 46 + t19 25 + t22 36）。完整「已实现/未实现」清单见 [draft5-plugin-fields.md](draft5-plugin-fields.md)。本文件 §1 的 D1–D6 已按 §8 更新。
 
 ---
 
@@ -258,3 +258,11 @@ t18 补齐 `decision.session_id` 回显与 `plugin_status.json`；t19 又修正�
 # t19 代码
 182 passed, 0 failed
 ```
+
+---
+
+## 9. t22：M1 / M4 / M6
+
+第二线评审（t14）插件侧三条已修：未知 `provider_id` 前缀按 §3.5 接受并写 `x_provider_unknown`；`bridge.lock` 按 §1.10 实现（pid/started_at/heartbeat_at、5s 心跳、30s TTL、僵死抢占、退出释放、双进程测试）；补 major 低/高与 rename EPERM 写失败测试。完整对照见 [t22-m1-m4-m6.md](t22-m1-m4-m6.md)。
+
+测试：t19 代码 **196 passed / 22 failed**；t22 代码 **218 passed / 0 failed**。

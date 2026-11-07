@@ -1,4 +1,5 @@
 import { promises as fsp } from 'node:fs'
+import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -355,6 +356,20 @@ const fakeExec = { agent: { model: { current: () => ({ provider: 'fake', model: 
 const resetStatus = typeof T.resetStatusStateForTest === 'function'
   ? T.resetStatusStateForTest
   : () => {}
+
+const ensureLock = typeof T.ensureBridgeLock === 'function'
+  ? T.ensureBridgeLock
+  : async () => ({ ok: false, reason: 'unavailable' })
+
+const releaseLock = typeof T.releaseBridgeLock === 'function'
+  ? T.releaseBridgeLock
+  : async () => {}
+
+const LOCK_FILE = typeof T.LOCK_FILE === 'string' ? T.LOCK_FILE : 'bridge.lock'
+
+const providerMatches = typeof T.providerSourceMatches === 'function'
+  ? T.providerSourceMatches
+  : () => false
 
 const refreshStatus = typeof T.refreshPluginStatus === 'function'
   ? T.refreshPluginStatus
@@ -843,7 +858,7 @@ async function withBridgeEnv(dir, fn) {
   eq('status current model provider', (status.x_runtime.current_model ?? {}).provider, 'fake')
   eq('status current model', (status.x_runtime.current_model ?? {}).model, 'fake-1')
   eq('status bridge dir', status.x_runtime.bridge_dir, bridgeDir)
-  eq('status lock held', status.x_runtime.lock_held, false)
+  eq('status lock held', status.x_runtime.lock_held, true)
   eq(
     'status error counts all five',
     JSON.stringify(status.x_runtime.error_code_counts),
@@ -979,6 +994,263 @@ async function withBridgeEnv(dir, fn) {
     code = error.reasonCode
   }
   eq('unsafe status filename rejected', code, 'io_error')
+}
+
+// ── 13. M1 未知 provider / M4 bridge.lock / M6 版本与写失败 ──────────────────
+{
+  // M1：未知 provider 前缀可接受但标记；已知前缀与 source 矛盾仍拒绝。
+  const state = freshState()
+  const draft = { choice: { type: 'item', item_id: 22 }, reason: 'ext', confidence: 1 }
+  let unknown = null
+  try {
+    unknown = T.makeDecisionDoc(state, draft, {
+      source: 'rule', providerId: 'seed_lookup:primary', fallback: false,
+    })
+  } catch {
+    unknown = null
+  }
+  eq('unknown provider marked', unknown?.x_provider_unknown, 'seed_lookup')
+  let threw = false
+  if (unknown) {
+    try {
+      T.assertDecisionLegal(unknown, state)
+    } catch {
+      threw = true
+    }
+  }
+  eq('unknown provider accepted', threw, false)
+
+  let unknownLlm = null
+  try {
+    unknownLlm = T.makeDecisionDoc(state, draft, {
+      source: 'llm', providerId: 'local_model:primary', fallback: false,
+    })
+  } catch {
+    unknownLlm = null
+  }
+  eq('unknown llm provider marked', unknownLlm?.x_provider_unknown, 'local_model')
+  eq('unknown provider source allowed', providerMatches('local_model:primary', 'llm'), true)
+
+  let knownCode = null
+  try {
+    T.makeDecisionDoc(state, draft, {
+      source: 'rule', providerId: 'llm:primary', fallback: false,
+    })
+  } catch (error) {
+    knownCode = error.errorCode
+  }
+  eq('known provider/source mismatch rejected', knownCode, 'INTERNAL')
+}
+
+{
+  // M4：同进程锁独占 + 心跳字段 + 释放。
+  await releaseLock()
+  const lockDir = path.join(tmpRoot, 'lock-case')
+  await fsp.mkdir(lockDir, { recursive: true })
+  const first = await ensureLock(lockDir)
+  const second = await ensureLock(lockDir)
+  eq('lock acquired', first.ok, true)
+  eq('lock reused by same process', second.ok, true)
+  const lock = (await readJsonIfExists(path.join(lockDir, LOCK_FILE))) ?? {}
+  eq('lock pid', lock.pid, process.pid)
+  ok('lock started_at', Number.isInteger(lock.started_at), String(lock.started_at))
+  ok('lock heartbeat_at', Number.isInteger(lock.heartbeat_at), String(lock.heartbeat_at))
+  eq('lock plugin version', lock.plugin_version, T.PLUGIN_VERSION)
+  await releaseLock()
+  eq('lock released', await fsp.stat(path.join(lockDir, LOCK_FILE)).then(() => true).catch(() => false), false)
+}
+
+{
+  // M4：他人持锁时降级不写；锁过期可抢占。
+  await releaseLock()
+  const liveDir = path.join(tmpRoot, 'lock-live')
+  await fsp.mkdir(liveDir, { recursive: true })
+  await fsp.writeFile(
+    path.join(liveDir, LOCK_FILE),
+    JSON.stringify({
+      pid: process.ppid,
+      started_at: Date.now(),
+      heartbeat_at: Date.now(),
+      plugin_version: 'other',
+    }),
+    'utf8',
+  )
+  const denied = await ensureLock(liveDir)
+  eq('live other lock denied', denied.ok, false)
+  eq('live other lock reason', denied.reason, 'lock_held')
+  const state = freshState()
+  state.request_id = 'r-lock-held-01'
+  const decision = await withBridgeEnv(liveDir, () => T.runIsaacDecide({
+    config: { bridgeDir: liveDir },
+    ctx: fakeLlmCtx([{ text: '{"item_id":22,"confidence":0.9}' }]),
+    args: { state },
+    exec: fakeExec,
+  }))
+  eq('lock held decision not written', decision.written, false)
+  eq('lock held decision discarded', decision.discarded, true)
+  eq('lock held decision error', decision.error_code, 'IO')
+  eq('lock held decision reason', decision.reason_code, 'bridge_unavailable')
+  eq(
+    'lock held leaves no decision',
+    await fsp.stat(path.join(liveDir, 'decision.json')).then(() => true).catch(() => false),
+    false,
+  )
+  await fsp.rm(path.join(liveDir, LOCK_FILE), { force: true })
+
+  const staleDir = path.join(tmpRoot, 'lock-stale')
+  await fsp.mkdir(staleDir, { recursive: true })
+  await fsp.writeFile(
+    path.join(staleDir, LOCK_FILE),
+    JSON.stringify({ pid: 999999, started_at: 0, heartbeat_at: 0, plugin_version: 'dead' }),
+    'utf8',
+  )
+  const stolen = await ensureLock(staleDir)
+  eq('stale lock stolen', stolen.ok, true)
+  await releaseLock()
+}
+
+{
+  // M4：两个进程并发，只有一个能拿锁写 decision。
+  await releaseLock()
+  const raceDir = path.join(tmpRoot, 'lock-race')
+  await fsp.mkdir(raceDir, { recursive: true })
+  const worker = path.join(tmpRoot, 'lock-worker.mjs')
+  await fsp.writeFile(worker, `
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+const entry = process.env.ISAAC_PLUGIN_ENTRY
+const mod = await import(entry.startsWith('file:') ? entry : pathToFileURL(entry).href)
+const { __testing: T } = mod
+const state = JSON.parse(process.env.ISAAC_STATE)
+const bridgeDir = process.env.ISAAC_BRIDGE
+const ctx = { get(name) { if (name !== 'llm') return undefined; return { stream() { return (async function* () { yield { type: 'text-delta', text: '{"item_id":22,"reason":"lock","confidence":0.9}' }; yield { type: 'finish', reason: { kind: 'stop' } } })() } } } }
+const exec = { agent: { model: { current: () => ({ provider: 'fake', model: 'f' }) } }, signal: new AbortController().signal }
+process.stdout.write('ready\\n')
+await new Promise((resolve) => process.stdin.once('data', resolve))
+const result = await T.runIsaacDecide({ config: { bridgeDir }, ctx, args: { state }, exec })
+process.stdout.write('RESULT ' + JSON.stringify(result) + '\\n')
+await new Promise((resolve) => setTimeout(resolve, 400))
+process.exit(0)
+`, 'utf8')
+
+  const state = freshState()
+  state.request_id = 'r-lock-race-01'
+  const workers = [0, 1].map(() => {
+    const child = spawn(process.execPath, [worker], {
+      env: {
+        ...process.env,
+        ISAAC_PLUGIN_ENTRY: moduleUrl.href,
+        ISAAC_AGENT_DIR: raceDir,
+        ISAAC_BRIDGE: raceDir,
+        ISAAC_STATE: JSON.stringify(state),
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const buffers = { out: '', err: '' }
+    child.stdout.on('data', (data) => { buffers.out += data })
+    child.stderr.on('data', (data) => { buffers.err += data })
+    return { child, buffers }
+  })
+
+  async function waitFor(marker, timeoutMs = 5000) {
+    const started = Date.now()
+    while (Date.now() - started < timeoutMs) {
+      if (workers.every(({ buffers }) => buffers.out.includes(marker))) return true
+      await sleep(20)
+    }
+    return false
+  }
+  eq('lock race workers ready', await waitFor('ready'), true)
+  for (const { child } of workers) child.stdin.write('go\n')
+  eq('lock race workers returned', await waitFor('RESULT'), true)
+  for (const { child } of workers) child.stdin.end()
+  await Promise.all(workers.map(({ child }) => new Promise((resolve) => {
+    if (child.exitCode !== null) return resolve()
+    child.once('close', resolve)
+  })))
+
+  const results = workers.map(({ buffers }) => {
+    const line = buffers.out.split(/\r?\n/).find((entry) => entry.startsWith('RESULT '))
+    return line ? JSON.parse(line.slice('RESULT '.length)) : null
+  })
+  const written = results.filter((result) => result?.written === true)
+  const denied = results.filter((result) => result?.written === false)
+  eq('lock race exactly one writer', written.length, 1)
+  eq('lock race one denied', denied.length, 1)
+  eq('lock race denied reason', denied[0]?.reason_code, 'bridge_unavailable')
+  const decision = JSON.parse(await fsp.readFile(path.join(raceDir, 'decision.json'), 'utf8'))
+  eq('lock race decision exists', decision.request_id, 'r-lock-race-01')
+}
+
+{
+  // M6：对端 major 更低（0.9）不写 decision，旧文件保持。
+  resetPublish()
+  const majorDir = path.join(tmpRoot, 'major-low')
+  await fsp.mkdir(majorDir, { recursive: true })
+  const oldBytes = '{"old":true}'
+  await fsp.writeFile(path.join(majorDir, 'decision.json'), oldBytes, 'utf8')
+  const state = freshState()
+  state.protocol_version = '0.9'
+  state.request_id = 'r-major-low-01'
+  const result = await withBridgeEnv(majorDir, () => T.runIsaacDecide({
+    config: { bridgeDir: majorDir },
+    ctx: fakeLlmCtx([{ text: '{"item_id":22}' }]),
+    args: { state },
+    exec: fakeExec,
+  }))
+  eq('low major not written', result.written, false)
+  eq('low major reason', result.reason_code, 'version_major')
+  eq('low major preserves old decision', await fsp.readFile(path.join(majorDir, 'decision.json'), 'utf8'), oldBytes)
+}
+
+{
+  // M6：rename 连续 EPERM → 不抛到工具层、旧文件保持、tmp 清理。
+  resetPublish()
+  const failDir = path.join(tmpRoot, 'write-fail')
+  await fsp.mkdir(failDir, { recursive: true })
+  const oldBytes = '{"old":true}'
+  await fsp.writeFile(path.join(failDir, 'decision.json'), oldBytes, 'utf8')
+  const state = freshState()
+  state.request_id = 'r-write-fail-01'
+  const draft = T.normalizeDraft({ item_id: 22, confidence: 0.8 }, state.state)
+  const doc = T.makeDecisionDoc(state, draft, {
+    source: 'llm', providerId: 'llm:primary', fallback: false,
+  })
+
+  const originalRename = fsp.rename
+  let directCode = null
+  try {
+    fsp.rename = async () => {
+      const error = new Error('EPERM')
+      error.code = 'EPERM'
+      throw error
+    }
+    try {
+      await T.writeDecisionAtomic(failDir, doc)
+    } catch (error) {
+      directCode = error.errorCode
+    }
+    eq('write failure direct code', directCode, 'IO')
+    eq('write failure preserves old file', await fsp.readFile(path.join(failDir, 'decision.json'), 'utf8'), oldBytes)
+    eq(
+      'write failure cleans tmp',
+      (await fsp.readdir(failDir)).filter((name) => name.includes('.tmp.')).length,
+      0,
+    )
+
+    const result = await withBridgeEnv(failDir, () => T.runIsaacDecide({
+      config: { bridgeDir: failDir },
+      ctx: fakeLlmCtx([{ text: '{"item_id":22,"confidence":0.9}' }]),
+      args: { state },
+      exec: fakeExec,
+    }))
+    eq('write failure tool no throw', result.ok, false)
+    eq('write failure tool discarded', result.discarded, true)
+    eq('write failure tool reason', result.discard_reason, 'write_failed')
+    eq('write failure tool keeps old', await fsp.readFile(path.join(failDir, 'decision.json'), 'utf8'), oldBytes)
+  } finally {
+    fsp.rename = originalRename
+  }
 }
 
 await fsp.rm(tmpRoot, { recursive: true, force: true })

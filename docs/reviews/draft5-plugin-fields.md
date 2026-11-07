@@ -2,15 +2,15 @@
 
 > 依据：`docs/protocol.md` **1.0-draft.5**（t8 Claude 补审 + captain 产品取舍，commit `fb9e25c`）与 `docs/architecture.md` v1.0-draft.5。
 > 范围：**DSH 插件侧必须产出/回显的字段**。mod 侧产出（state/event/applied、`actual_item_id`、气泡）不在此表。
-> 分支：`agent/t19-overstrict-fixes`（基于 t18 并合入 t8 draft.5 文档）。测试：`plugin/tests/plugin.test.mjs`（182 项）。
+> 分支：`agent/t22-m1-m4-m6`（基于 t19，含 t18/t8 draft.5）。测试：`plugin/tests/plugin.test.mjs`（218 项）。
 
 ---
 
 ## 0. 结论
 
 - **已实现**：`decision.session_id` 回显、`plugin_status.json`（含任务要求的运行状态扩展）、draft.5 对 decision 的既有字段要求。
-- **未实现（已知）**：`bridge.lock`（因此 `plugin_status.x_runtime.lock_held` 恒为 `false`，只代表“本插件未持锁”）、按 `(session_id, gen_level_key)` 的缓存/指纹、`applied.json` 回读、viewer 倾向接入、读路径 TOCTOU、模型流完全不返回时的强制取消。
-- 测试：修复前（t13 代码）**137 passed / 45 failed**；修复后 **182 passed / 0 failed**。
+- **已实现**：`bridge.lock`（t22；pid/started_at/heartbeat_at/TTL/抢占/退出释放）。**未实现（已知）**：按 `(session_id, gen_level_key)` 的缓存/指纹、`applied.json` 回读、viewer 倾向接入、读路径 TOCTOU、模型流完全不返回时的强制取消。
+- 测试：修复前（t19 代码）**196 passed / 22 failed**；修复后 **218 passed / 0 failed**。
 
 ---
 
@@ -90,8 +90,8 @@ draft.5 §1.11 定义（插件写、mod/QA 读，可选诊断，不替代 `appli
     "last_failure_ts": null,
     "error_code_counts": { "IO": 0, "TIMEOUT": 0, "VALIDATION": 0, "MODEL": 0, "INTERNAL": 0 },
     "bridge_dir": "C:\\Users\\<user>\\AppData\\Local\\IsaacAgent",
-    "lock_held": false,
-    "lock_mode": "process-local"
+    "lock_held": true,
+    "lock_mode": "file+process-local"
   }
 }
 ```
@@ -103,8 +103,8 @@ draft.5 §1.11 定义（插件写、mod/QA 读，可选诊断，不替代 `appli
 | `last_success_ts` / `last_failure_ts` | 最近一次成功发布 / 失败时刻（epoch ms） |
 | `error_code_counts` | 进程内累计五类错误计数（不清零，重启归零） |
 | `bridge_dir` | 当前桥目录绝对路径（任务要求；仅本地诊断文件） |
-| `lock_held` | 当前是否持有 `bridge.lock`；**本插件未实现 bridge.lock，恒 false** |
-| `lock_mode` | `process-local`：用进程内写队列 + 发布闸门串行化 |
+| `lock_held` | 当前是否持有 `bridge.lock`（t22 已实现） |
+| `lock_mode` | `file+process-local`：文件锁 + 进程内写队列/发布闸门 |
 
 ### 2.3 状态机与写入时机
 
@@ -147,7 +147,7 @@ draft.5 §1.11 定义（插件写、mod/QA 读，可选诊断，不替代 `appli
 | `version_major` 时写 `refused/version_major` | ✅ | 测试 `major mismatch status refused/error/reason` |
 | decision `features`/`requires` 保留 | ✅ | 输出空数组 |
 | decision `provider_id` 前缀与 source 一致 | ✅ | t13 自检 |
-| `bridge.lock` 单写者锁 | ❌ | 未实现；见 §4 |
+| `bridge.lock` 单写者锁 | ✅ | t22：pid/started_at/heartbeat_at/TTL/抢占/退出释放；双进程测试 |
 | 按 `(session_id, gen_level_key)` 缓存/指纹 | ❌ | 未实现；只做发布闸门 |
 | 读 `applied.json` 做消费确认 | ❌ | 插件不写/不读 applied |
 | viewer 倾向权重接入 | ❌ | 当前 `viewer` 只接受 votes/note |
@@ -156,16 +156,14 @@ draft.5 §1.11 定义（插件写、mod/QA 读，可选诊断，不替代 `appli
 
 ---
 
-## 4. 已知未实现（明确不在 t18）
+## 4. 已知未实现（明确不在 t22）
 
-1. **`bridge.lock`**：插件按调用执行、非常驻；用进程内写队列 + 发布闸门。因此 `plugin_status.x_runtime.lock_held` 恒 `false`、`lock_mode="process-local"`。多 DSH 进程同时跑仍可能互写。
-2. **§6.7 的 session 级缓存/指纹**：没有按 `(session_id, gen_level_key)` 合并/复用结果；只保证旧结果不覆盖新结果、同一 request 不重复发布。
-3. **`applied.json` 回读**：插件不读取 mod 的消费回执；“消费一次即作废”是插件侧发布语义。
-4. **viewer 倾向**：t5 设计已给出 `weights/label/sample_n`，尚未接入 `isaac_decide`。
-5. **读路径 TOCTOU**：`isaac_state` 仍只在入口校验一次；父目录被换 junction 的读风险未消除（写路径已修）。
-6. **模型流完全不返回**：若适配器既不 yield 也不结束，`for await` 无法被 AbortSignal 强制结束；需要可取消的流包装或宿主级超时。
-7. **`capabilities`**：draft.4 已统一为 `features`；插件不读也不写 `state.capabilities`（旧字段忽略）。
-8. **`actual_item_id`**：mod 的回执字段，插件不产出。
+1. **§6.7 的 session 级缓存/指纹**：没有按 `(session_id, gen_level_key)` 合并/复用结果；只保证旧结果不覆盖新结果、旧结果可按指纹绑定最新请求。
+2. **`applied.json` 回读**：插件不读取 mod 的消费回执；消费由 mod 侧 `outstanding`/`applied.json` 表达。
+3. **viewer 倾向**：t5 设计已给出 `weights/label/sample_n`，尚未接入 `isaac_decide`。
+4. **读路径 TOCTOU**：`isaac_state` 仍只在入口校验一次；父目录被换 junction 的读风险未消除（写路径已修）。
+5. **`capabilities`**：draft.4 已统一为 `features`；插件不读也不写 `state.capabilities`（旧字段忽略）。
+6. **`actual_item_id`**：mod 的回执字段，插件不产出。
 
 ---
 
@@ -190,14 +188,14 @@ draft.5 §1.11 定义（插件写、mod/QA 读，可选诊断，不替代 `appli
 $ cmd /c "git show bfb0734:plugin/index.js > %TEMP%\isaac-t18-prefix.js"
 $ set PLUGIN_ENTRY=%TEMP%\isaac-t18-prefix.js
 $ node plugin/tests/plugin.test.mjs
-137 passed, 45 failed
+196 passed, 22 failed
 
 # 修复后
 $ node --check plugin/index.js      # exit 0
-$ node plugin/tests/plugin.test.mjs # 182 passed, 0 failed
+$ node plugin/tests/plugin.test.mjs # 218 passed, 0 failed
 ```
 
-45 条失败来自新增的 session_id / plugin_status / t19（发布≠消费、硬截止、reason 拒绝）断言；原有 111 项仍全过。
+22 条失败来自新增的 provider 扩展、bridge.lock、写失败 discarded 断言；既有断言仍全过。
 
 ---
 
@@ -210,4 +208,4 @@ npm --prefix plugin test
 python tools/mock_e2e.py
 ```
 
-预期：`182 passed, 0 failed`；mock 4/4 场景 52/52 断言。
+预期：`218 passed, 0 failed`；mock 4/4 场景 52/52 断言。
