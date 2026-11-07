@@ -214,3 +214,60 @@ t12 已修 5 处，逐条核过代码与测试，确认落地：
 | revision | 日期 | 内容 |
 | --- | --- | --- |
 | r1 | 2026-11-07 | 初版（DeepSeek 第二线）。GPT 线报告未落盘，对照节待补。 |
+| r1（续） | 2026-11-07 | t15：核验临时评审员 8 条发现并作为 §6 附录并入（见下）。r2 保留给 GPT 对照节。 |
+
+---
+
+## 6. 附录：临时评审员 8 条发现核验（t15）
+
+> 来源：一位临时评审员（未署名、报告未落盘）交来 8 条实测发现。本节由 reviewer-ds 对着当前代码逐条复核，判定「成立 / 已修 / 不成立」。基线：契约 `fb9e25c`（draft.5）；Lua 实现 `origin/agent/t12-lua-defects`；插件实现 `origin/main`（7d4e102，源码与 ba5e61c 一致）。临时评审员引用的行号（如 `main.lua L638-699`）是 t3 旧版行号，本节一律改用当前代码的真实行号。
+
+### 6.1 Profile A 探测没有 --luadebug 门控 —— **成立（部分），并入 M7**
+
+- 判定：**成立（部分）**。由临时评审员首次发现、reviewer-ds 复核。
+- 证据：`mods/isaac_agent/main.lua:743-805` `bridge_detect` + `main.lua:704-740` `bridge_probe_dir`——只探测 `io_available()` / `os_available()`（`main.lua:550-558`），无任何 `--luadebug` 启动参数字符串检查；探测写 `.probe.tmp` 成功即 `S.profile = "A"`，失败即 `"none"`（`main.lua:762-804`）。
+- 澄清与后果：协议 §1.8 明确"只有在玩家已用 `--luadebug` 启动时写探针才可能成功"，即"靠 io/os 探测判 `--luadebug`"是协议认可的机制，本身不算缺陷。**真正的问题是代码没有 Profile B 状态**（= 本报告 M7）：io/os 不可用时落 `"none"`（纯本地规则），而非文档说的"默认 B（mod 只读 decision）"。后果：captain 定的"默认 B"产品形态在代码里不存在；玩家不改启动项得到的是纯本地规则，文档承诺的"B 只读桥"落空。`[静态]`（沙箱 `io` 缺失来自 t3 实测结论，本机未起游戏复验）。
+- 改法：见 M7——要么实现真·Profile B（只读 decision），要么协议/README 把默认形态如实改为"无桥接（本地规则）"。
+
+### 6.2 rename 失败先删目标再重试 —— **已修，不计必修**
+
+- 判定：**已修**。
+- 证据：`mods/isaac_agent/main.lua:606-687` `bridge_write_raw` 已是 `.bak` 保底路径：`os.rename(target, bak)` → `os.rename(tmp, target)` → 失败回滚 `os.rename(bak, target)`，全程无 `os.remove(target)` 先行删除。`tests/lua_logic_test.lua:760-778` T22 patch `os.rename` 全失败后验证旧 state 字节不变、无 tmp/.bak 残留。t12 已修。
+
+### 6.3 两端平局排序不一致 —— **不成立（两端结果一致）**
+
+- 判定：**不成立**。
+- 证据：draft.5 §6.5.6 已规定"非空 `pedestal_index` 升序 → 数组下标 → `item_id`"。Lua 侧 `first_matching` / `first_candidate`（`main.lua:1591-1617`）实现"pedestal_index 升序（null 靠后）→ ipairs 数组序"；TS 侧 `compareCandidates`（`index.js:540-556`）实现"pedestal_index 升序（null 靠后）→ index → item_id"。数组下标唯一，`item_id` 平票分支不可达，故两端**无实际分歧**。差异只在可读性：Lua 靠 ipairs 隐含序、TS 显式 `index`。建议 Lua 侧把"数组下标"显式化，并入 L6（可读性），非正确性缺陷。
+
+### 6.4 插件缺跨进程锁 —— **成立，= 已有 M4**
+
+- 判定：**成立**。由临时评审员首次发现、reviewer-ds 复核；与本报告 M4 为同一缺陷。
+- 证据：`plugin/index.js:284-293` `withWriteLock` 是进程内 Promise 串行队列；注释（`index.js:280-282`）自认"非常驻进程，用进程内串行队列代替 bridge.lock"。§1.10 的 `bridge.lock` / 持有者存活检测未实现。多 DSH 进程并发仍可能互相覆盖 `decision.json`。
+- 改法：见 M4。
+
+### 6.5 路径校验薄弱 —— **成立，= 已有 L3，另补 UNC 子项**
+
+- 判定：**成立**。由临时评审员首次发现、reviewer-ds 复核；与本报告 L3 为同一缺陷，另补 UNC 观察。
+- 证据：`plugin/index.js:181-213` `resolveBridgeDir` 只对"第一个存在的祖先"做一次 realpath/symlink 校验；`plugin/index.js:216-230` `safeFilePath` 写盘时只 lstat 文件本身、不重验父目录 realpath，lstat 与后续 open/rename 之间有 TOCTOU。UNC 路径：`path.isAbsolute('\\\\server\\share\\...')` 返回 true，代码未对 UNC 明确纳入/排除根白名单，realpath 在 UNC 上的行为未验证 `[静态]`。
+- 改法：见 L3 + 明确 UNC 处理策略（默认拒绝或显式白名单）。
+
+### 6.6 未发现代码执行 —— **成立（正面结论）**
+
+- 判定：**成立（已核实的正面结论）**。由临时评审员首次确认、reviewer-ds 复核。
+- 证据：`plugin/index.js:707-739` `normalizeDraft` 只做 `JSON.parse` + 字段选择（`item_id` 整数且必须在候选池 / `action` 白名单 `skip`），`reason` 走 `sanitizeReason`；`mods/isaac_agent/main.lua:1432-1452` `validate_decision` 同样只收候选池内 id 或 `skip`，`reroll` 被拒。无 `eval` / `Function` / 子进程。协议 §9"不执行远端代码"红线满足。
+
+### 6.7 五条失败路径的测试质量 —— **部分成立**
+
+- 判定：**部分成立**，逐项：
+  1. **超时（模型中途超时）——成立**：`tools/mock_e2e.py` 场景 4 用 `state["ts"] = now - 5000` 的"预先陈旧 state"测"预算已耗尽 → 不调模型"，未测 `plugin/index.js:745-758` `callModelOnce` 的 AbortController 中途超时路径（模型流挂住、`timer` 触发 → `TIMEOUT`）。
+  2. **写入失败——成立（仅插件侧）**：`tools/mock_e2e.py` 无 rename/EPERM 场景；`plugin/index.js:295-353` `writeDecisionAtomic` / `renameWithRetry` 无任何测试。Lua 侧 T22 已覆盖 rename 失败，故"完全没有测试"仅对插件成立。
+  3. **迟到响应——部分成立**：mock 无迟到场景（成立）；"Lua 也没有"不成立——`tests/lua_logic_test.lua:512-525` T10（clock+2000 → reject `late`）与 `tests/lua_logic_test.lua:700-724` T20（消费后同 request 再投 → `late`）都覆盖了迟到。
+  4. **版本不匹配——成立**：Lua T07 有（major 不匹配 → `version_major`）；`tools/mock_e2e.py` 无 `version_major` 场景（场景 2 只测缺 `request_id` 信封）。
+  5. **T06"没推进时钟、看起来测了"——不成立（指控）**：T06（`tests/lua_logic_test.lua:452-466`）确实只 `clear_decision()` 后立即 `draw`，测的是"无决策文件 → TIMEOUT"路径；但"时钟过期"路径由 T10（迟到）与 T21（过期缓存）覆盖，三者互补，不是漏测。
+- 改法：为插件补 `callModelOnce` 中途超时、`writeDecisionAtomic` rename 失败、state major 不兼容三组离线测试（并入 M6）。
+
+### 6.8 `python -m unittest discover -s tools/tests` 在 main 上失败 —— **不成立（当前 main 上）**
+
+- 判定：**不成立**。
+- 证据（复现）：`cd 仓库 && python -m unittest discover -s tools/tests` → `Ran 15 tests ... OK`（exit 0）。`tools/tests/test_danmaku_sim.py` 在 `origin/main`（7d4e102）存在，由 t5 合入（4c23f0a）带入；README 的 `python -m unittest discover -s tools/tests -p "test_*.py"` 与真实结构对齐。临时评审员大概率在旧 main（ba5e61c，t5 未合、tools/tests 尚未创建）上核的。
+- 顺带（非本条，供 qa）：README/CONTRIBUTING 里"Lua 逻辑 74 条断言"是陈旧数字（t12 后为 106 条），可顺手更新。
