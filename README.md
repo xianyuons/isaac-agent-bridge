@@ -13,7 +13,7 @@ in DSH's credential store. The bridge is plain UTF-8 JSON on local disk, with no
 access from the mod.
 
 > **Status: offline-verified, not smoke-tested on a real game install.**
-> Contract: `docs/protocol.md` **v1.1-draft.1** (wire version `1.0`). The Lua logic is
+> Contract: `docs/protocol.md` **v1.1-draft.2** (wire version `1.0`). The Lua logic is
 > covered by 106 offline assertions, the plugin by 111 offline assertions, and the JSON
 > contract by `tools/mock_e2e.py` (4 scenarios / 52 assertions). The author's machine does
 > not have REPENTOGON installed, so **no end-to-end run inside the actual game has been
@@ -38,9 +38,10 @@ access from the mod.
 
 1. **Profile A only in v1:** when a room is entered (and again while waiting for a generation),
    the mod exports the run: player, items, room/floor/boss, and the **candidate pool**
-   (max 64 ids). Profile B/C are not implemented in v1. Without Profile A (no
-   `--luadebug`/REPENTOGON file API), the mod writes no bridge files and runs local rules
-   only — this is called **local-only**, not Profile B.
+   (max 64 ids). Profile B alone is infeasible in v1; Profile C (shared SaveData relay) is a
+   v1.1 candidate, not shipped. Without Profile A (no `--luadebug`/REPENTOGON file API), the
+   mod writes no bridge files and runs local rules only — this is called **local-only**,
+   not Profile B.
 2. The DSH plugin reads that state (or receives a full `StateDoc` inline), calls the model
    once with the candidate ids, validates the answer against the protocol, and atomically
    writes `decision.json`.
@@ -78,16 +79,18 @@ for what was considered reusable and what was deliberately rejected.
 ## Profiles and launch flags (read this before installing)
 
 v1 has **one live-bridge mode (Profile A)** and one non-bridge mode (**local-only**).
-It does **not** implement the protocol's Profile B: "no bridge" is not B, and v1 does not
-consume preset `decision.json` without a bridge. The full decision is in
+It does **not** implement Profile B: B is **infeasible alone** (default Lua has no `io`;
+REPENTOGON's `os` is cut to `date/time/clock/difftime`, so the mod cannot read an arbitrary
+`decision.json`). The viable default candidate is **Profile C: shared `Mod:SaveData/LoadData`
+relay**, deferred to v1.1+. The full decision is in
 [docs/reviews/decisions-m5-m7.md](docs/reviews/decisions-m5-m7.md).
 
 | Mode | Who writes | Who reads | Status in this repo |
 | --- | --- | --- | --- |
 | **Profile A (v1 only bridge)** | mod writes `state/event/applied`; plugin writes `decision/plugin_status/lock` | both sides | **implemented**; requires file I/O (`--luadebug` or REPENTOGON file API) |
 | **local-only (not a profile)** | plugin writes `decision/plugin_status/lock`; mod writes nothing | mod reads nothing | default without A; local rules + bubble; **cannot run the agent** |
-| **Profile B (v1.1+)** | plugin writes `decision`; mod reads it and writes no state | mod | **not implemented**; needs a stable read API (t21) |
-| **Profile C (v1.1+)** | SaveData relay | plugin-side feeder | **not implemented**; must not be claimed |
+| **Profile B (alone infeasible)** | plugin writes `decision`; mod would read it and write no state | mod | **not a v1 target**; default sandbox has no `io`, `os` is cut to time functions; read-only cannot export state |
+| **Profile C (v1.1 candidate)** | mod and plugin share a `Mod:SaveData/LoadData` data file; `epoch`/`turn` fences | mod + plugin | **not implemented**; C1 single-file (1.0.12e) / C2 dual-file (REPENTOGON ≥1.1.2e); C3 arbitrary filename **not** available in 1.1.3 |
 
 ### Default without a bridge: local-only, no launch flags
 
@@ -114,6 +117,27 @@ When the file probe succeeds you get `state.json` / `decision.json` in
 `%LOCALAPPDATA%\IsaacAgent\` and the agent path becomes active. The mod itself never
 requires DSH to be running: if the plugin is absent, decisions simply time out and the mod
 falls back to local rules with an explicit bubble.
+
+### v1.1 candidate: Profile C (shared SaveData relay)
+
+Not implemented in v1. B alone is infeasible (the mod can read only `Mod:LoadData` data, not
+an arbitrary `decision.json`), but `Mod:LoadData` / `Mod:SaveData` **are** file I/O at a fixed
+path: `<game>/data/<mod>/save<slot>.dat`, plain text (the local `just_gambling/save1.dat`
+fixture is JSON). The v1.1 plan is to share that file as a relay:
+
+- **C1 (works on 1.0.12e+):** one shared file plus `epoch`/`turn` fences so mod and plugin
+  never overwrite each other; widest compatibility.
+- **C2 (REPENTOGON ≥ 1.1.2e):** two files via `Isaac.LoadModDataFromFolder(folder)`; 1.1.3
+  is the current release and has this API.
+- **C3 (do not rely on):** arbitrary `Mod:LoadData(filename)` / `SaveData(data, filename)`
+  exists only on the unreleased REPENTOGON `main` (after 1.1.3); not in 1.1.3.
+
+> **C's hard limit: save corruption means the player loses progress.** Any implementation
+> must never write a half file, must use a separate file, must carry a version field, and
+> must keep the old file on failure. Two things still need a real-game check before calling
+> it "live": whether `LoadData` actually re-reads the file on every call, and whether the
+> game's save/exit path overwrites `save<slot>.dat`. See t25 spike
+> (`docs/spike-profile-b.md`, branch `agent/t25-profile-b-spike`, cbea2fe).
 
 ---
 
@@ -346,11 +370,12 @@ tools/tests/           # danmaku simulator unit tests
   dependency injection; changing behavior requires editing `plugin/index.js` or
   `mods/isaac_agent/main.lua` and running the tests. A minimal interface layer is a v1.1
   roadmap item, not a v1 promise. See [decisions-m5-m7](docs/reviews/decisions-m5-m7.md).
-- **Profile A only; no Profile B in v1.** A live bridge requires `--luadebug` (or a
-  REPENTOGON file API). Without it the mod is **local-only**: it writes no bridge files,
-  does not read `decision.json`, and runs local rules. Profile B (mod reads preset
-  decisions, writes no state) is **not implemented**; Profile C (SaveData relay) is also
-  v1.1+. "No bridge" must not be called Profile B.
+- **Profile A only in v1; B alone is infeasible; C is a v1.1 candidate.** A live bridge
+  requires `--luadebug` (or a REPENTOGON file API). Without it the mod is **local-only**:
+  it writes no bridge files, does not read `decision.json`, and runs local rules. Profile B
+  cannot export state and the default sandbox cannot read an arbitrary file; the viable
+  default is **Profile C** (shared `Mod:SaveData/LoadData` relay), deferred to v1.1+ (C1
+  single-file / C2 dual-file). "No bridge" must not be called Profile B.
 - **Not smoke-tested in a real game.** All green results are offline/mock; the author's
   machine has no REPENTOGON install. Treat this as a working prototype.
 - **No decision queue.** One active generation target, latest-wins; multi-pedestal rooms
@@ -389,7 +414,7 @@ examples and both implementations, then run the offline tests above.
 **API key 只存在于 DSH 的凭据存储里**：游戏侧、mod、桥目录、日志、`reason` 文本都不
 会出现 key。游戏侧不联网，只读写本地 JSON。
 
-## 两种形态（v1：Profile A 或 local-only；B/C 未实现）
+## 两种形态（v1：Profile A 或 local-only；B 单独不可行，C 是 v1.1 候选）
 
 **v1 只有 Profile A 能实时跑 agent；没有桥接时叫 local-only，不叫 Profile B。** 协议 §1.4
 和 [M5/M7 决策](docs/reviews/decisions-m5-m7.md) 写死了这个口径；不要再把“默认 B”写回来。
@@ -404,8 +429,15 @@ examples and both implementations, then run the offline tests above.
   只走**本地规则兜底**（没红心先回血 → 没输出先补伤害 → 否则取第一个候选），气泡明确提示
   `桥接不可用（本地规则）`，并如实标成兜底。**不能拿当前这局实时问模型**，v1 也不消费预置
   `decision.json`；这不是 Profile B。
-- **Profile B / C（v1.1+，未实现）**：B（mod 只读 decision、不写 state）需要稳定读文件 API，
-  t21 待证；C（SaveData 中继）有类型/冲突/审计问题。v1 不得声称支持，也不得作为保底。
+- **Profile B（单独不可行）**：默认沙箱没有 `io`，REPENTOGON 的 `os` 只剩
+  `date/time/clock/difftime`；只读解决不了“mod 把局面导出给插件”，所以 B 单独不成立。
+- **Profile C（v1.1 候选，可行）**：`Mod:SaveData/LoadData` 本身就是文件读写，固定落在
+  `<游戏目录>/data/<mod>/save<槽位>.dat`，内容为纯文本（本机 `just_gambling/save1.dat`
+  实测是 JSON）。v1.1 计划：C1 单文件共享 + `epoch`/`turn` 栅栏（兼容 1.0.12e）；C2 双文件
+  （`Isaac.LoadModDataFromFolder`，REPENTOGON ≥ 1.1.2e，1.1.3 已发布）；C3 任意文件名只在
+  未发布的 main 上，**不依赖**。
+  ⚠️ **存档损坏 = 玩家丢进度**：必须永不写半截、独立文件、版本字段、失败保留旧文件；并先
+  真机验证 `LoadData` 是否每次读盘、游戏存档/退出会不会覆盖 `save<槽位>.dat`。
 
 **没装 REPENTOGON 会怎样**：mod 把 REPENTOGON 声明为硬依赖（回调注册/时序都依赖它）。
 在原生 Repentance+ 加载器下它可能加载失败或钩子行为不对；这种配置不受支持，也没有
@@ -442,7 +474,8 @@ python -m unittest discover -s tools/tests -p "test_*.py"
   `Presenter` 是文档里的概念约束，不是代码接口；要改行为得改
   `plugin/index.js` / `mods/isaac_agent/main.lua` 并跑测试，不能热插拔。v1.1 才抽最小接口层。
 - **v1 只支持 Profile A + local-only**：没有 `--luadebug`/文件 API 时走本地规则，**不叫
-  Profile B**；B/C 均未实现，见协议 §1.4 与 [M5/M7 决策](docs/reviews/decisions-m5-m7.md)。
+  Profile B**；B 单独不可行，C（共享 SaveData 中继）是 v1.1 候选、v1 未实现。见协议 §1.4 与
+  [M5/M7 决策](docs/reviews/decisions-m5-m7.md)。
 - `applied.json` / `event.json` 是 latest-wins 回执，不是完整审计日志。
 - 同一时刻只服务一个生成目标；多底座房间、快速 reroll 会走本地规则，详见协议 §11。
 - B 站弹幕/聊天只做到**设计与离线模拟**（`docs/danmaku.md`），默认关闭，未接真实直播间、

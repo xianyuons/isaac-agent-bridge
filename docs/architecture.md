@@ -1,6 +1,6 @@
-# 架构：分层、接口与扩展点（v1.1-draft.1）
+# 架构：分层、接口与扩展点（v1.1-draft.2）
 
-> 版本：v1.1-draft.1（2026-11-07，t24 M5/M7 决策回写）。协议细节见 [protocol.md](protocol.md) §12 变更记录。
+> 版本：v1.1-draft.2（2026-11-07，t25 spike 修正 M7 表述：B 单独不可行，C 可行但 v1.1+）。协议细节见 [protocol.md](protocol.md) §12 变更记录。
 > 配套：[协议](protocol.md)、[代码规范](standards.md)、[M5/M7 决策](reviews/decisions-m5-m7.md)。
 > 目标：把“游戏侧读局面 / 插件侧做决策 / 表现层展示”拆成四层，层与层之间只通过本文列出的接口通信。**v1 的扩展点是概念约束，不是代码接口；改行为需改实现（见 M5 决策）。**
 
@@ -12,7 +12,7 @@
    - 协议里的 1500ms 是 **决策有效期/超时判定**，不是 mod 的阻塞等待；
    - mod 必须在生成前 **预取** 决策到内存；回调里只查内存表，不读盘、不调模型、不写盘；
    - 没命中就返回 `nil`（原版）或本地规则结果（必须仍属于候选池），绝不卡帧。
-2. **v1 只支持 Profile A 的实时桥；无桥接 = local-only，不叫 Profile B。** v1 没有实现“mod 只读 decision、不写 state”的 Profile B；原生沙箱连读 `decision.json` 所需的 `io` 都没有。玩家不加 `--luadebug`（或 REPENTOGON 文件 API）时，mod 不写任何桥文件、不读 decision，回调只跑本地规则并明确提示“桥接不可用”。要实时 agent 必须启用 Profile A——那不是“给本 mod 开一个开关”，而是 **给所有 mod 放开文件访问**。Profile B / C 推迟到 v1.1+。**任何契约都不得假设 mod 能写盘。**
+2. **v1 只支持 Profile A 的实时桥；无桥接 = local-only。B 单独不可行，C 可行但推迟 v1.1+。** v1 没有实现“mod 只读 decision”的 Profile B；原生沙箱无 `io`，REPENTOGON 的 `os` 也被裁到只剩 `date/time/clock/difftime`，只读解决不了“把局面导出给插件”。可行的默认形态是 **Profile C：共享 `Mod:SaveData/LoadData` 数据文件做中继**，v1.1 候选 C1/C2，v1 不做。要实时 agent 仍必须启用 Profile A——给所有 mod 放开文件访问。**任何契约都不得假设 mod 能写盘。**
 3. **气泡是事后核验。** 气泡在 `POST_PICKUP_INIT`（底座实体初始化）比较“实际生成的 item id”和“决策的 item id”之后再弹，用于解释这次是 llm 还是兜底；不在生成前假装已经生效。
 
 ### 0.1 回调 62 的真实时机（别把“生成”当“玩家拿走”）
@@ -104,27 +104,36 @@ flowchart TB
 
 ---
 
-## 2. 写入模型：v1 只支持 Profile A；无桥接 = local-only；B/C v1.1+
+## 2. 写入模型：v1 只支持 A；无桥接 = local-only；B 单独不可行，C 可行（v1.1+）
 
-| | Profile A（**v1 唯一桥接**） | Profile B（v1.1+，未实现） | Profile C（v1.1+，未实现） |
+| | Profile A（**v1 唯一桥接**） | Profile B（单独不可行） | Profile C（v1.1+，可行） |
 | --- | --- | --- | --- |
-| 前提 | mod 可读可写 `<bridge>`，需要 `--luadebug` 或 REPENTOGON 文件 API | mod 只读 `decision.json`，不写 state；需稳定读文件 API（t21 待证） | `Mod:SaveData` + 插件侧 feeder |
-| `state/event/applied` 写者 | mod | **无**（不导出实时局面） | 插件侧 feeder（内容仍由 mod 生成） |
-| `decision.json` / `plugin_status.json` / `bridge.lock` 写者 | 插件 | 插件 | 插件 |
-| 实时 agent | ✅ | ❌（只能预置决策/本地规则） | ⚠️ 取决于 SaveData 可见性 |
-| 主要风险 | `--luadebug` **给所有 mod 开文件访问**，不是“本 mod 的开关” | 读文件 API 未证明；不能实时问模型 | 协议塞存档：类型受限、易与存档机制冲突、审计困难 |
-| 失败可见性 | `applied.json` | 气泡 + `Isaac.DebugString` + `plugin_status.json` | `applied.json` |
+| 前提 | mod 可读可写 `<bridge>`，需要 `--luadebug` 或 REPENTOGON 文件 API | 默认沙箱无 `io`；REPENTOGON `os` 仅 `date/time/clock/difftime`；只能读 `Mod:LoadData` 的 mod 数据文件，不能读任意 `decision.json` | 共享 `Mod:SaveData/LoadData` 数据文件（纯文本，固定 `<游戏目录>/data/<mod>/save<槽位>.dat`） |
+| `state/event/applied` 写者 | mod | **无**（不导出实时局面） | mod 写入共享数据文件，插件侧 feeder 读取（C1 单文件 / C2 双文件） |
+| `decision.json` / `plugin_status.json` / `bridge.lock` 写者 | 插件 | 插件 | 插件（写入同一/另一 mod 数据文件，epoch/turn 栅栏） |
+| 实时 agent | ✅ | ❌ | ⚠️ 可行但需真机验证 `LoadData` 是否每次读盘、存档时是否被覆盖 |
+| 主要风险 | `--luadebug` **给所有 mod 开文件访问**，不是“本 mod 的开关” | 只读不能把局面导出，B 单独不成立 | **存档损坏 = 玩家丢进度**；必须永不写半截、独立文件、版本字段、失败保留旧文件 |
+| 失败可见性 | `applied.json` | 气泡 + `Isaac.DebugString` + `plugin_status.json` | 共享文件里的 status + 插件日志 |
 
 **v1 实际只有两种运行形态：**
 
 1. **Profile A（桥接，能实时 agent）**：玩家以 `--luadebug` 启动（或 REPENTOGON 暴露文件 API），探针读写通过；mod 写 `state/event/applied`，插件写 `decision/plugin_status`。
 2. **local-only（无桥接，不能实时 agent）**：没有 `--luadebug`/探针失败；mod 不写任何桥文件、不读 `decision.json`，回调只跑本地规则，气泡提示“桥接不可用（本地规则）”。**这不是 Profile B**，不要称它为默认 B，也不要暗示预置决策可用。
 
-**Profile B（v1.1+）**：真正的“mod 只读 decision、不写 state”；需要 t21 证明有稳定读文件 API。**v1 未实现**。Profile C（SaveData 中继）同样 v1.1+，理由见 protocol §11.9。
+**Profile B（单独不可行）**：只有“mod 读、插件写”解决不了导出；默认沙箱无 `io`，`os` 只剩时间函数，所以 mod 读不到任意 `decision.json`。v1 不实现，也不再把它当 v1.1 的目标形态。
+
+**Profile C（v1.1+，默认形态的候选）**：`Mod:LoadData` / `Mod:SaveData` 本身就是文件读写，固定落在 mod 数据目录，文件是纯文本（本机 `just_gambling/save1.dat` 实测是 JSON）。三档实现：
+
+- **C1（兼容面最大，1.0.12e+）**：单文件共享 + `epoch`/`turn` 栅栏防 mod/插件互相覆盖；不依赖新 API。
+- **C2（更干净，REPENTOGON ≥ 1.1.2e）**：用 `Isaac.LoadModDataFromFolder(folder)` 把 state/decision 拆成两文件；1.1.3 已发布并含该 API。
+- **C3（任意文件名，不依赖）**：`Mod:LoadData(filename)` / `Mod:SaveData(data, filename)` 只在 REPENTOGON 未发布的 main（changelog `v1.1.x`）里有，**1.1.3 没有**；v1.1 不依赖它，只用探针探测。
+
+> C 的共同红线：**存档损坏 = 玩家丢进度**。实现必须“永不写半截、独立文件、版本字段、失败保留旧文件”；`LoadData` 是否每次读盘、游戏存档/退出会不会覆盖 `save<槽位>.dat`，必须在真机验证后再宣称“实时”。
+> 依据：t25 spike，`docs/spike-profile-b.md`（分支 `agent/t25-profile-b-spike`，cbea2fe）。
 
 - **启动探针**：写 `.probe.tmp` → rename → 读回 → 删除；读写分别判定；结果写日志并（可写时）写进 `state.features`。探针失败 → local-only，不进入桥接路径；**不得** 在帧回调里做。
 - **契约条件式（硬约束）**：任何地方都 **不得** 假设 mod 能写盘。`state/event/applied` 只有 Profile A 由 mod 写；local-only 没有这三份文件。
-- `plugin_status.json` 是插件诊断（protocol §1.11），B/A 都由插件写、mod 只读；它不替代 `applied.json`。
+- `plugin_status.json` 是插件诊断（protocol §1.11），A/local-only 都由插件写、mod 只读；它不替代 `applied.json`。
 - 共同点：**`decision.json` 是唯一必需方向，mod 永不阻塞。**
 
 ---

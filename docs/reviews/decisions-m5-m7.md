@@ -1,11 +1,12 @@
 # 决策记录：M5（扩展点是否落代码）与 M7（Profile B 诚实表述）
 
-> 任务：t24。依据：第二线实现级评审 `docs/reviews/impl-review-deepseek.md`（M5/M7）、当前实现
-> （`plugin/index.js` 单体、`mods/isaac_agent/main.lua` 单体、探针失败即纯本地规则）、
-> `docs/protocol.md` / `docs/architecture.md` draft.5。
+> 任务：t24（M5/M7 决策）+ t25 修正（Profile B spike）。依据：第二线实现级评审
+> `docs/reviews/impl-review-deepseek.md`（M5/M7）、当前实现（`plugin/index.js` 单体、
+> `mods/isaac_agent/main.lua` 单体、探针失败即纯本地规则）、t25 spike
+> `docs/spike-profile-b.md`（分支 `agent/t25-profile-b-spike`，cbea2fe）。
 > 日期：2026-11-07。负责人：contract。
-> 结论：**M5 选 A（v1 只在文档中作为设计约束，不是代码接口）；M7 选 A（v1 只支持
-> Profile A + 纯本地规则；不把无桥接叫 Profile B；B 推迟 v1.1+）**。
+> 结论：**M5 选 A（v1 只在文档中作为设计约束，不是代码接口）；M7 v1 选 A（只支持
+> Profile A + local-only，不把无桥接叫 Profile B）；B 单独不可行，C 可行但推迟 v1.1+**。
 
 ---
 
@@ -61,57 +62,50 @@ v1 的实际代码形态：
 
 ### 2.1 选了什么
 
-**v1 选 A（行为上）：只支持 Profile A 的实时桥；没有 Profile A 时走纯本地规则。**
-**不把“无桥接 + 本地规则”称为 Profile B。Profile B 推迟到 v1.1+。**
+**v1 选 A（行为上）：只支持 Profile A 的实时桥；没有 Profile A 时走纯本地规则（local-only）。**
+**不把“无桥接 + 本地规则”称为 Profile B。**
+**B 单独不可行；C（共享 SaveData 中继）可行，但 v1 不做，列为 v1.1+ 的头号候选。**
+
+> 注意：这里的 A/B/C 是 **M7 的选项**（v1 怎么表述）；下面提到的 **Profile C** 是协议里的传输形态。两者不是同一个 C。
 
 具体口径：
 
 | 场景 | v1 实际行为 | 是否叫 Profile |
 | --- | --- | --- |
 | 玩家用 `--luadebug`（或 REPENTOGON 暴露文件 API），探针读写通过 | mod 写 `state/event/applied`、读 `decision`；插件实时决策 | **Profile A** |
-| 玩家不加启动项 / 沙箱无 `io` / 探针失败 | mod 不写任何桥文件、不读 `decision`；回调 62 只跑本地规则 + 气泡“桥接不可用（本地规则）” | **不是 Profile B**；叫“无桥接（local-only）” |
-| SaveData 中继 | 不实现 | **Profile C 推迟 v1.1+** |
+| 玩家不加启动项 / 沙箱无 `io` / 探针失败 | mod 不写任何桥文件、不读 `decision`；回调 62 只跑本地规则 + 气泡“桥接不可用（本地规则）” | **local-only**，不是 Profile B |
+| 共享 `Mod:SaveData/LoadData` 数据文件中继 | v1 不实现 | **Profile C（v1.1+ 候选）** |
 
-**Profile B 的严格定义保留给未来**：mod 只读 `decision.json`、能消费预置决策，但 **不写**
-`state/event/applied`。v1 没有实现“读 `decision.json`”这一步（原生沙箱连 `io` 都没有），
-所以不能把本地规则包装成 B。
+**Profile B 单独不可行**：只读解决不了“mod 把局面导出给插件”；默认沙箱无 `io`，REPENTOGON 的 `os` 也被裁到只剩 `date/time/clock/difftime`，mod 读不到任意 `decision.json`。v1 不实现，v1.1 也不再把它当目标形态——真正能落地的默认形态是 Profile C。
 
 ### 2.2 为什么
 
-1. **实现事实**：t3/t14 已确认原生 Isaac 沙箱不提供 `io`/`os`（需 `--luadebug`）；探针失败
-   后 mod 直接走本地规则，**没有**读 `decision.json`。把这种情况叫“默认 Profile B”是虚假
-   陈述，会让人以为预置决策可用。
-2. **t21 可行性未回**：真 B 需要 mod 能读任意路径文件；REPENTOGON 是否暴露稳定读 API 尚未
-   证明。等 t21 再决定是否 v1.1 做 B，不阻塞 v1 的诚实表述。
-3. **安全与预期**：v1 的默认安装就是“本地规则 + 明示桥接不可用”，不是“默认能跑 agent”。
-   这样用户不会为了一个不存在的默认能力去装 REPENTOGON/DSH。
-4. **不选 C 的原因**：C（“无桥接时走本地规则，桥接需要 --luadebug”）行为上等同 A，但容
-   易继续把“无桥接”与 Profile B 混在一起。决策文档和协议必须把 **B 明确标成未实现**，
-   所以采用 A 的行为定义 + C 的直白文案（“无桥接 = local-only，不是 B”）。
+1. **B 单独不可行（spike 实测/源码）**：默认启动下 `io` 不存在；装了 REPENTOGON 后 `os` 也只有 `date/time/clock/difftime`，没有 `rename/remove/getenv`。纯 B 只读不写，插件拿不到局面，产品上不成立。
+2. **C 可行**：`Mod:LoadData()` / `Mod:SaveData()` 本身就是文件读写，固定落在 `<游戏目录>/data/<mod>/save<槽位>.dat`，内容是纯文本；本机 `just_gambling/save1.dat` 实测就是 JSON。它不依赖 `--luadebug`，所以 v1.1 可以把它做成默认桥。
+3. **v1 范围不变**：t25 spike 也建议 v1 仍按 A/local-only 发；C 需要 ~2.5–3 人日 + 真机联调，且最大的风险是存档覆盖/损坏（玩家丢进度），不适合塞进 v1。
+4. **M7 选项 C 与 Profile C 的区别**：M7 任务里的“选项 C”是“文档改成无桥接走本地规则、桥接需要 --luadebug”的**措辞选项**；我们采纳其直白文案，但行为上仍是 A/local-only。协议里的 Profile C 是 SaveData 中继，是 v1.1 的实现路线，不是 v1 的措辞。
 
 ### 2.3 对使用者的影响
 
-- **v1 实时 agent 必须 `--luadebug`**（或未来 REPENTOGON 文件 API）。默认安装只有本地规则，
-  气泡明确提示，不假装 agent 可用。
-- `README` 不再写“默认 Profile B”；改为“v1 支持 Profile A；无桥接 = local-only；B/C 未实现”。
-- 安装说明把 `--luadebug` 写成“实时 agent 的前置条件”，不是可选增强；安全警告保留
-  “给所有 mod 放开文件访问”。
-- 没有实时 `state.json` 时，`isaac_state` 没有 live 数据；`isaac_decide` 可以用外部传入的
-  完整 StateDoc 生成决策，但这不是从游戏内实时导出，不能与 A 混称。
+- **v1 实时 agent 必须 `--luadebug`**（或未来 REPENTOGON 文件 API）。默认安装只有本地规则，气泡明确提示，不假装 agent 可用。
+- `README` 不再写“默认 Profile B”；改为“v1 支持 Profile A；无桥接 = local-only；B 单独不可行；C 是 v1.1 候选”。
+- 安装说明把 `--luadebug` 写成“实时 agent 的前置条件”，不是可选增强；安全警告保留“给所有 mod 放开文件访问”。
+- 没有实时 `state.json` 时，`isaac_state` 没有 live 数据；`isaac_decide` 可以用外部传入的完整 StateDoc 生成决策，但这不是从游戏内实时导出，不能与 A 混称。
+- 不向用户承诺“默认安装即可用 agent”；也不把 C 说成已可用。
 
 ### 2.4 以后怎么改（升级路径）
 
-- **v1.1 候选 1（真 B）**：如果 t21 证明 REPENTOGON 提供稳定只读文件 API，实现“mod 只读
-  decision、插件写 decision/status”，默认安装即可消费预置决策；仍不能实时问模型（没有
-  state 导出）。届时更新协议 §1.4、README、探针与测试。
-- **v1.1 候选 2（真 B + SaveData 导出）**：用 `Mod:SaveData` 导出 state（Profile C），
-  插件侧 feeder 落盘；这是完整默认形态，但要先解决存档类型/冲突/审计（已在 protocol §11.9
-  记录为推迟理由）。
+- **v1.1 头号候选：Profile C（共享 SaveData 中继）**，分三档：
+  1. **C1（兼容面最大，任意 REPENTOGON 含 1.0.12e）**：mod 与插件共享**同一个** `saveN.dat`，用 `epoch`/`turn` 栅栏防互相覆盖；先做这个。
+  2. **C2（更干净，REPENTOGON ≥ 1.1.2e）**：用 `Isaac.LoadModDataFromFolder(folder)` 把 state/decision 拆成两个 mod 数据文件；1.1.3 是最新发布并含该 API。
+  3. **C3（任意文件名，不依赖）**：`Mod:LoadData(filename)` / `Mod:SaveData(data, filename)` 只在 REPENTOGON 未发布的 main（changelog `v1.1.x`）里有，**1.1.3 没有**；不要依赖，最多用探针探测。
+- **C 的红线**：**存档损坏 = 玩家丢进度**。实现必须做到“永不写半截、独立文件、版本字段、失败保留旧文件”；并且先真机验证两件事：`LoadData()` 是否每次读盘、游戏存档/退出会不会覆盖 `save<槽位>.dat`。未验证前不得宣称“实时”。
 - 升级时必须：
   1. 先改协议（profile 语义/字段）并升 minor；
   2. 两端实现 + 契约测试；
   3. README/安装/安全说明同步；
   4. 不得在实现前宣称支持。
+- 依据：t25 spike `docs/spike-profile-b.md`（分支 `agent/t25-profile-b-spike`，cbea2fe）。
 
 ---
 
@@ -119,11 +113,10 @@ v1 的实际代码形态：
 
 - **wire 协议字段不变**：`protocol_version` 仍为 `1.0`，`state/decision/event/applied` 的
   字段与校验不变。M5 不涉及 wire；M7 只改“Profile 语义/默认”，不改 JSON 结构。
-- **规范文档 minor 升到 `1.1-draft.1`**：这是 profile 语义（默认从 B 改为“A only + local-only”）
-  的 minor 更正；`protocol.md` §1.4、§0、§11、§12 与 `architecture.md` §0/§2/§4/§8 同步。
+- **规范文档 minor 升到 `1.1-draft.2`**：t24 先把默认从 B 改为“A only + local-only”（1.1-draft.1）；t25 spike 再修正为“B 单独不可行、C 可行但 v1.1+”（1.1-draft.2）。`protocol.md` §1.4、§0、§11、§12 与 `architecture.md` §0/§2/§4/§8 同步。
 - 不在本次把 wire `protocol_version` 改成 `1.1`：那会迫使两端实现、测试、样例与已发布的
   `1.0` 快照一起改，却没有字段变化；等真正出现字段级 minor 时再统一升 wire。
-- README 的版本行改为 `v1.1-draft.1 (wire 1.0)`，Limitations 写清 M5/M7。
+- README 的版本行改为 `v1.1-draft.2 (wire 1.0)`，Limitations 写清 M5/M7 与 C 的 v1.1 候选。
 
 ## 4. 验收 / 回写位置
 

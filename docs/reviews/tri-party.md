@@ -5,7 +5,7 @@
 > 方式：同一份提纲（五问 + Q6）。DeepSeek 由当前会话模型按提纲直接评审；GPT 为 tokenshop 独立进程调用；Claude 为 ginka 独立进程调用（t8 补审）。三家都只接收文档与提纲，未接收其他评审内容。
 > **快照不对称（必须注明）**：DeepSeek / GPT 评审的是回写前 `v1.0-draft.2`；Claude 补审的是已吸收前两家回写的 `v1.0-draft.3`。因此 Claude 的若干 P0 是对“回写后文档”的再检查，不是同一快照的三方对照；不能把三份意见当成对同一版本的同时投票。
 > 本文件 revision r2：DeepSeek + GPT（r1）+ Claude 补审（t8）+ 回写记录（protocol/architecture `v1.0-draft.5`，含 t8 期间 captain 产品取舍）。
-> **t24 更新**：M7 决策把 v1 表述修正为「只支持 Profile A + local-only，B/C v1.1+」；本文中“默认 B”的历史描述以 [decisions-m5-m7](decisions-m5-m7.md) 与 protocol 1.1-draft.1 为准。
+> **t24/t25 更新**：t24 把 v1 表述修正为「只支持 Profile A + local-only，B/C v1.1+」；t25 spike 进一步确认 **B 单独不可行、C（共享 SaveData 中继）可行但 v1.1+**。本文中“默认 B”的历史描述以 [decisions-m5-m7](decisions-m5-m7.md) 与 protocol 1.1-draft.2 为准。
 
 ## 0. 结论摘要
 
