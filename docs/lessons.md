@@ -56,3 +56,14 @@
 | 共享工作树在别人分支上、还有未提交改动，差点被 git add -A 卷进别人的提交 | 所有人共用一个 worktree | **每个任务固定一个独立 worktree**（如 `E:\Yuki\工作\isaac-agent-t3`），提交完再回共享树 |
 | 以为 Lua 沙箱能随便写盘 | IsaacDocs Standard-Library：`io`/`os` **只在 `--luadebug` 下可用** | 游戏侧默认走 Profile B（mod 只读 decision，插件负责写）；要 Profile A 就明写"需要 `--luadebug` 启动"，并在 README 提示这会放开 mod 的文件权限 |
 | 目录口径两套：任务书写 `mods/isaac_agent/`，规范写 `lua/` | 规范起草时没对齐游戏的真实目录结构 | **统一到 `mods/<mod名>/`**（游戏要求），规范里补一句：游戏侧按 mod 结构，其余照原规范 |
+
+## 2026-11-07 t10 实现评审补记（GPT；captain 批准落盘）
+
+- Lua 74/74 全绿仍漏消费、缓存和写入失败 → 断言主要覆盖单次生成及超有效期迟到，没有生成后迟到和故障注入 → 分别回放消费后新 decision_id、已缓存跨有效期、两次 rename/flush/close 失败，测试数量不得代替关键路径证据。
+- 进程内写队列被当成跨进程锁 → Promise 只串行同模块的发布，既不排除另一进程，也不管理请求新旧 → bridge.lock 做实例互斥，发布代次/指纹校验另防 R1 慢结果覆盖 R2；两类保证必须分开验证。
+- 旧请求在生成后再次产生 llm 命中 → 只清 S.decision，没有终结该目标 outstanding，下一底座复用 K → 任意生成终态清同 K 未决项并隔离迟到，下一目标建立新身份。
+- 路径初检通过后写到外目录 → 文件操作前未重验父目录 realpath，校验后被换成 junction → 在实际读写边界核验目录身份和批准根；声称抗并发替换时还要固定目录句柄并测试替换竞态。
+- Lua rename 失败后旧 state 消失 → 先 remove(dest)，第二次 rename 仍失败且无恢复 → 旧版本保留/恢复与 tmp 清理必须一起故障注入，不以成功覆盖测试代替失败测试。
+- Python 到 Lua 的诊断脚本连续两次因换行转义语法失败 → 多层字符串把 Lua 字符串中的反斜线换行再解释 → 诊断优先 print 传参、减少转义层；先编译检查，再跑有副作用的复现。
+- create_worktree 报 not a git repository → 当前会话目录仍为会话存储目录，pwsh 的 workdir 不会改变会话工作目录 → 先 working_directory 读/切到仓库，再创建独立 worktree，不能从 checkout 路径推断当前目录。
+- 依赖报告写 draft.5 而 main 实际为 draft.3 → t8 未完整集成，分支名称/提交说明不能证明文件版本 → 读取文首与变更记录，固定契约 commit；这是集成缺陷，不把它误报成设计主动回退。
