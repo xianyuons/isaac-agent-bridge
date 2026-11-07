@@ -10,8 +10,12 @@
   },
   "files": [
     "index.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "tests"
   ],
+  "scripts": {
+    "test": "node tests/plugin.test.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

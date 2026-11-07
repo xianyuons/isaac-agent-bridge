@@ -49,13 +49,19 @@ const MAX_DECISION_BYTES = 8 * 1024
 const MAX_CANDIDATES = 64
 const MAX_ITEMS = 1024
 const MAX_REASON_CHARS = 280
+const MAX_REASON_BYTES = 1024
 const MAX_INTENT_CHARS = 280
 const MAX_VOTE_ENTRIES = 64
+const MAX_FEATURE_ENTRIES = 32
+const MAX_FEATURE_LENGTH = 64
 
 const ERROR_CODES = new Set(['IO', 'TIMEOUT', 'VALIDATION', 'MODEL', 'INTERNAL'])
 const TRIGGER_TYPES = new Set(['pedestal_spawn', 'room_enter', 'boss_approach', 'reroll', 'custom'])
 const SAFE_REASON_CODES = new Set(['no_candidate', 'player_dead'])
 const ACTION_WHITELIST = new Set(['skip'])
+// 本插件能对硬依赖（state.requires）承诺的能力；未知能力按 §7.4 拒绝。
+// 只声明真正实现的：读 state.json、原子写 decision.json。
+const PLUGIN_CAPABILITIES = new Set(['transport:file_read', 'transport:file_write'])
 
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,64}$/
 const DECISION_ID_RE = /^[A-Za-z0-9_-]{8,64}$/
@@ -136,14 +142,21 @@ function stripControlChars(text) {
   return String(text).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
 }
 
-/** 单行化并截断 reason；超长按 code point 截断，不切断代理对。 */
+/** 单行化并按“字符数 + UTF-8 字节数”双重截断 reason；超长不拒绝，截断后发布。 */
 function sanitizeReason(value) {
   if (typeof value !== 'string') return null
   const oneLine = stripControlChars(value).replace(/\s+/g, ' ').trim()
   if (oneLine.length === 0) return null
   const chars = Array.from(oneLine)
-  if (chars.length <= MAX_REASON_CHARS) return oneLine
-  return chars.slice(0, MAX_REASON_CHARS).join('')
+  let out = ''
+  let count = 0
+  for (const char of chars) {
+    if (count >= MAX_REASON_CHARS) break
+    if (byteLength(out + char) > MAX_REASON_BYTES) break
+    out += char
+    count += 1
+  }
+  return out.length > 0 ? out : null
 }
 
 function shortText(value, max = 160) {
@@ -308,47 +321,297 @@ async function renameWithRetry(from, to, { attempts = 3, delays = [20, 60, 120] 
   throw lastError
 }
 
-async function writeDecisionAtomic(bridgeDir, doc) {
+/**
+ * 写入前重新确认“父目录的真实路径 == 调用方给的桥目录”。
+ *
+ * 防的是 TOCTOU：resolveBridgeDir 通过后，父目录被换成指向别处的 junction。
+ * 这里 mkdir 之后再 realpath，任何 junction/symlink 都会让 realpath 与路径不符，直接拒绝。
+ * 目录不存在时 mkdir 会创建它；创建失败按 IO 处理。
+ *
+ * 注意：桥目录里有 mod 写的 `.isaac_agent_owner` 所有者令牌（mod 写入前后各校验一次，
+ * 不一致就判定目录被替换并停写）。本函数及本文件任何路径都**不得**删除、改写、清空它，
+ * 也不得把它当临时文件清理；只允许读 state.json / decision.json 与自己的 `.tmp` 文件。
+ */
+async function ensureRealBridgeDir(bridgeDir) {
+  try {
+    await fsp.mkdir(bridgeDir, { recursive: true })
+  } catch {
+    throw new IsaacError('IO', 'io_error', '无法创建桥目录')
+  }
+
+  let realDir
+  try {
+    realDir = await fsp.realpath(bridgeDir)
+  } catch {
+    throw new IsaacError('IO', 'io_error', '无法解析桥目录真实路径')
+  }
+  if (!isSamePath(realDir, bridgeDir)) {
+    throw new IsaacError(
+      'VALIDATION',
+      'io_error',
+      '桥目录在写入前变成了符号链接/联接点（realpath 与白名单路径不符），已拒绝',
+    )
+  }
+
+  const stat = await lstatOrNull(realDir)
+  if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new IsaacError('VALIDATION', 'io_error', '桥目录不是真实目录（可能是符号链接/联接点），已拒绝')
+  }
+  return realDir
+}
+
+function serializeDecision(doc) {
   const json = JSON.stringify(doc)
   if (byteLength(json) > MAX_DECISION_BYTES) {
     throw new IsaacError('VALIDATION', 'out_of_range', `decision.json 超过 ${MAX_DECISION_BYTES} 字节上限`)
   }
+  return json
+}
 
-  return withWriteLock(async () => {
-    // mod 可能还没创建目录；写前补建，但不改变已校验的白名单根。
-    try {
-      await fsp.mkdir(bridgeDir, { recursive: true })
-    } catch {
-      throw new IsaacError('IO', 'io_error', '无法创建桥目录')
+/** 已在写锁内：不再获取锁，直接做真实目录校验 + 原子替换。 */
+async function writeDecisionLocked(bridgeDir, doc) {
+  const json = serializeDecision(doc)
+  const realDir = await ensureRealBridgeDir(bridgeDir)
+  const file = await safeFilePath(realDir, DECISION_FILE)
+  const tmp = path.join(
+    realDir,
+    `${DECISION_FILE}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`,
+  )
+
+  let handle
+  let cleanupPath = tmp
+  try {
+    handle = await fsp.open(tmp, 'wx', 0o600)
+    // 打开后立刻确认临时文件真的落在 realDir 内；若父目录在 open 前被换成 junction，
+    // 这一步会在写任何数据之前发现并清理。
+    const tmpReal = await fsp.realpath(tmp)
+    cleanupPath = tmpReal
+    if (!isSamePath(path.dirname(tmpReal), realDir)) {
+      throw new IsaacError('VALIDATION', 'io_error', '临时文件落在桥目录之外，已拒绝')
     }
-
-    const file = await safeFilePath(bridgeDir, DECISION_FILE)
-    const tmp = path.join(
-      bridgeDir,
-      `${DECISION_FILE}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`,
-    )
-
-    let handle
-    try {
-      handle = await fsp.open(tmp, 'wx', 0o600)
-      await handle.writeFile(json, 'utf8')
-      await handle.sync()
-    } catch {
-      if (handle) await handle.close().catch(() => undefined)
-      handle = undefined
-      await fsp.rm(tmp, { force: true }).catch(() => undefined)
-      throw new IsaacError('IO', 'io_error', '写 decision.json 临时文件失败（旧文件保持不动）')
-    }
+    await handle.writeFile(json, 'utf8')
+    await handle.sync()
+  } catch (error) {
     if (handle) await handle.close().catch(() => undefined)
+    handle = undefined
+    await fsp.rm(cleanupPath, { force: true }).catch(() => undefined)
+    if (error instanceof IsaacError) throw error
+    throw new IsaacError('IO', 'io_error', '写 decision.json 临时文件失败（旧文件保持不动）')
+  }
+  if (handle) await handle.close().catch(() => undefined)
 
-    try {
-      await renameWithRetry(tmp, file)
-    } catch {
-      await fsp.rm(tmp, { force: true }).catch(() => undefined)
-      throw new IsaacError('IO', 'io_error', '替换 decision.json 失败（旧文件保持不动）')
+  // 替换前再确认一次父目录没有被换成 junction。
+  let realAgain
+  try {
+    realAgain = await fsp.realpath(realDir)
+  } catch {
+    realAgain = null
+  }
+  if (!realAgain || !isSamePath(realAgain, realDir)) {
+    await fsp.rm(cleanupPath, { force: true }).catch(() => undefined)
+    throw new IsaacError(
+      'VALIDATION',
+      'io_error',
+      '桥目录在替换前变成了符号链接/联接点，已拒绝（旧文件保持不动）',
+    )
+  }
+
+  try {
+    await renameWithRetry(tmp, file)
+  } catch {
+    await fsp.rm(cleanupPath, { force: true }).catch(() => undefined)
+    throw new IsaacError('IO', 'io_error', '替换 decision.json 失败（旧文件保持不动）')
+  }
+
+  return { bytes: byteLength(json), file: DECISION_FILE, dir: realDir }
+}
+
+async function writeDecisionAtomic(bridgeDir, doc) {
+  return withWriteLock(() => writeDecisionLocked(bridgeDir, doc))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 发布闸门：R1/R2 竞态 + 消费一次即作废
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 进程内“最新请求”表。mod 的 state.json 是最终事实来源，但插件可能在 R2 写入后
+ * 还没读到它，所以先用进程内登记挡住 R1 的迟到结果；写盘前再读一次 state.json 复核。
+ *
+ * 只接受 ts 不比当前更新的登记，避免乱序读到的旧 state 抢占“最新”。
+ */
+const PUBLISH_TTL_MS = 10 * 60 * 1000
+const MAX_TRACKED_REQUESTS = 64
+
+const publishState = {
+  latest: null,
+  byKey: new Map(),
+  consumed: new Map(),
+}
+
+function resetPublishStateForTest() {
+  publishState.latest = null
+  publishState.byKey.clear()
+  publishState.consumed.clear()
+}
+
+function prunePublishState(now = Date.now()) {
+  for (const [requestId, at] of publishState.consumed) {
+    if (now - at > PUBLISH_TTL_MS) publishState.consumed.delete(requestId)
+  }
+  for (const [key, entry] of publishState.byKey) {
+    if (entry !== publishState.latest && now - entry.startedAt > PUBLISH_TTL_MS) {
+      publishState.byKey.delete(key)
     }
+  }
+  if (publishState.latest && now - publishState.latest.startedAt > PUBLISH_TTL_MS) {
+    publishState.byKey.delete(publishState.latest.genLevelKey)
+    publishState.latest = null
+  }
+  while (publishState.byKey.size > MAX_TRACKED_REQUESTS) {
+    let oldestKey = null
+    let oldestAt = Infinity
+    for (const [key, entry] of publishState.byKey) {
+      if (entry.startedAt < oldestAt) {
+        oldestAt = entry.startedAt
+        oldestKey = key
+      }
+    }
+    if (oldestKey === null) break
+    publishState.byKey.delete(oldestKey)
+  }
+}
 
-    return { bytes: byteLength(json), file: DECISION_FILE }
+function registerRequest(state) {
+  const now = Date.now()
+  prunePublishState(now)
+  const entry = {
+    requestId: state.request_id,
+    genLevelKey: state.gen_level_key,
+    ts: state.ts,
+    startedAt: now,
+  }
+  const latest = publishState.latest
+  if (!latest || state.ts >= latest.ts) publishState.latest = entry
+  const keyLatest = publishState.byKey.get(state.gen_level_key)
+  if (!keyLatest || state.ts >= keyLatest.ts) publishState.byKey.set(state.gen_level_key, entry)
+  return entry
+}
+
+function staleGate(discardReason, errorCode, reasonCode) {
+  return { ok: false, discardReason, errorCode, reasonCode }
+}
+
+/** validity 的硬截止：state.ts 是请求发出时刻，超过它再写就是 late。 */
+function isPastValidity(state, now = Date.now()) {
+  const validityMs = state.validity_ms ?? DEFAULT_VALIDITY_MS
+  return now >= state.ts + validityMs
+}
+
+/**
+ * 写 decision 前判定：当前请求是否仍是最新、是否已被消费、是否已过有效期。
+ * 返回 { ok:true } 或 { ok:false, discardReason, errorCode, reasonCode }。
+ */
+async function evaluatePublishGate({ bridgeDir, state, stateSource, requireFresh = false }) {
+  prunePublishState()
+
+  // 迟到结果（模型忽略 AbortSignal 时常见）一律不写盘；不能只依赖 AbortSignal 生效。
+  if (requireFresh && isPastValidity(state)) {
+    return staleGate('late', 'TIMEOUT', 'late')
+  }
+
+  if (publishState.consumed.has(state.request_id)) {
+    return staleGate('already_consumed', 'VALIDATION', 'request_mismatch')
+  }
+
+  const latest = publishState.latest
+  if (latest && (latest.requestId !== state.request_id || latest.genLevelKey !== state.gen_level_key)) {
+    const levelChanged = latest.genLevelKey !== state.gen_level_key
+    return staleGate(
+      levelChanged ? 'level_changed' : 'superseded',
+      'VALIDATION',
+      levelChanged ? 'level_mismatch' : 'request_mismatch',
+    )
+  }
+
+  const keyLatest = publishState.byKey.get(state.gen_level_key)
+  if (keyLatest && keyLatest.requestId !== state.request_id) {
+    return staleGate('superseded', 'VALIDATION', 'request_mismatch')
+  }
+
+  // 文件模式下再读一次 state.json：mod 可能已经写了 R2，而插件还没登记 R2。
+  if (stateSource !== 'inline') {
+    try {
+      const { doc } = await readStateFile(bridgeDir)
+      if (isPlainObject(doc) && isNonEmptyString(doc.request_id)) {
+        const diskTs = isInt(doc.ts, 0, Number.MAX_SAFE_INTEGER) ? doc.ts : 0
+        const levelChanged = doc.gen_level_key !== state.gen_level_key
+        if (diskTs >= state.ts && (doc.request_id !== state.request_id || levelChanged)) {
+          return staleGate(
+            levelChanged ? 'level_changed' : 'superseded',
+            'VALIDATION',
+            levelChanged ? 'level_mismatch' : 'request_mismatch',
+          )
+        }
+      }
+    } catch {
+      // state.json 暂时缺失/不可读：以进程内登记为准（mod 可能正在原子替换）。
+    }
+  }
+
+  return { ok: true }
+}
+
+function recordDiscard(ctx, state, gate) {
+  const meta = {
+    module: 'publish',
+    request_id: state.request_id,
+    gen_level_key: state.gen_level_key,
+    discard_reason: gate.discardReason,
+    reason_code: gate.reasonCode,
+  }
+  try {
+    const logger = ctx?.logger ?? ctx?.get?.('logger')
+    if (logger && typeof logger.warn === 'function') {
+      logger.warn('[isaac-agent] decision discarded', meta)
+    }
+  } catch {
+    // 日志失败不能影响丢弃决定。
+  }
+}
+
+function discardedResult(state, gate, meta) {
+  return {
+    ok: true,
+    text: `[丢弃/${gate.reasonCode}] request=${state.request_id} reason=${gate.discardReason}；不覆盖 decision.json`,
+    written: false,
+    discarded: true,
+    discard_reason: gate.discardReason,
+    request_id: state.request_id,
+    gen_level_key: state.gen_level_key,
+    error_code: gate.errorCode,
+    reason_code: gate.reasonCode,
+    elapsed_ms: meta?.elapsedMs ?? 0,
+    state_source: meta?.stateSource ?? 'file',
+    state_mtime_ms: meta?.stateMtimeMs ?? null,
+  }
+}
+
+/**
+ * 发布决策的唯一出口：写锁内复核“仍是最新请求 / 未被消费”，再原子写。
+ * 抛错表示写盘失败；返回 written:false 表示主动丢弃（不写盘）。
+ */
+async function publishDecision({ bridgeDir, state, stateSource, doc, ctx, requireFresh = false }) {
+  return withWriteLock(async () => {
+    const gate = await evaluatePublishGate({ bridgeDir, state, stateSource, requireFresh })
+    if (!gate.ok) {
+      recordDiscard(ctx, state, gate)
+      return { written: false, discarded: true, ...gate }
+    }
+    const written = await writeDecisionLocked(bridgeDir, doc)
+    // 一次生成恰好消费一个 choice；同一 request_id 不再发布第二份决策。
+    publishState.consumed.set(state.request_id, Date.now())
+    return { written: true, ...written }
   })
 }
 
@@ -373,6 +636,31 @@ function checkTags(tags, where) {
   return null
 }
 
+/** features/requires 形状校验；requires 额外按 §7.4 拒绝本端未知能力。 */
+function checkCapabilityList(value, field, { enforceKnown }) {
+  if (value === undefined) return null
+  if (!Array.isArray(value)) return { reasonCode: 'invalid_type', message: `${field} 必须是数组` }
+  if (value.length > MAX_FEATURE_ENTRIES) {
+    return { reasonCode: 'out_of_range', message: `${field} 超过 ${MAX_FEATURE_ENTRIES} 条` }
+  }
+  for (const item of value) {
+    if (!isNonEmptyString(item, MAX_FEATURE_LENGTH)) {
+      return { reasonCode: 'invalid_type', message: `${field} 含非法条目` }
+    }
+  }
+  if (enforceKnown) {
+    for (const item of value) {
+      if (!PLUGIN_CAPABILITIES.has(item)) {
+        return {
+          reasonCode: 'version_minor_feature',
+          message: `${field} 含本端未知能力：${item}`,
+        }
+      }
+    }
+  }
+  return null
+}
+
 /**
  * 校验 StateDoc。
  *
@@ -382,7 +670,8 @@ function checkTags(tags, where) {
  *   { ok: false, fatal: false, errorCode, reasonCode, message }  // body 不合法：写 valid:false 拒绝决策
  */
 function validateStateDoc(doc) {
-  if (!isPlainObject(doc)) return invalid('invalid_type', 'state 文档必须是 JSON 对象')
+  // 连 JSON 对象都不是：拿不到 request_id / gen_level_key，属于“信封不可读”，不得写 decision。
+  if (!isPlainObject(doc)) return fatal('invalid_type', 'state 文档必须是 JSON 对象')
 
   // 信封：版本、request_id、gen_level_key —— 任一不可用都不能安全地写 decision。
   const version = doc.protocol_version
@@ -413,6 +702,10 @@ function validateStateDoc(doc) {
   if (doc.reason_code !== undefined && doc.reason_code !== null && !isNonEmptyString(doc.reason_code, 64)) {
     return invalid('invalid_type', 'reason_code 必须是字符串或 null')
   }
+  const featuresError = checkCapabilityList(doc.features, 'features', { enforceKnown: false })
+  if (featuresError) return invalid(featuresError.reasonCode, featuresError.message)
+  const requiresError = checkCapabilityList(doc.requires, 'requires', { enforceKnown: true })
+  if (requiresError) return invalid(requiresError.reasonCode, requiresError.message)
 
   const trigger = doc.trigger
   if (!isPlainObject(trigger)) return invalid('missing_field', 'trigger 缺失')
@@ -428,8 +721,13 @@ function validateStateDoc(doc) {
   if (trigger.event_seq !== undefined && !isInt(trigger.event_seq, 1, Number.MAX_SAFE_INTEGER)) {
     return invalid('out_of_range', 'trigger.event_seq 必须是正整数')
   }
-  if (trigger.payload !== undefined && !isPlainObject(trigger.payload)) {
-    return invalid('invalid_type', 'trigger.payload 必须是对象')
+  if (trigger.payload !== undefined) {
+    if (!isPlainObject(trigger.payload)) {
+      return invalid('invalid_type', 'trigger.payload 必须是对象')
+    }
+    if (trigger.payload.pool !== undefined && !isNonEmptyString(trigger.payload.pool, 64)) {
+      return invalid('invalid_type', 'trigger.payload.pool 必须是非空字符串（池级预取的池标识）')
+    }
   }
 
   const state = doc.state
@@ -509,14 +807,18 @@ function validateStateDoc(doc) {
     if (candidate.pedestal_index !== null && !isInt(candidate.pedestal_index, 0, 63)) {
       return invalid('out_of_range', `candidates[${index}].pedestal_index 非法`)
     }
-    if (
-      candidate.pedestal_index !== null
-      && trigger.pedestal_index !== null
-      && candidate.pedestal_index !== trigger.pedestal_index
-    ) {
+    if (trigger.pedestal_index === null) {
+      // 池级预取：trigger 与所有候选的 pedestal_index 都必须为 null（protocol §2.1）。
+      if (candidate.pedestal_index !== null) {
+        return invalid(
+          'state_invalid',
+          `池级预取的 candidates[${index}].pedestal_index 必须为 null`,
+        )
+      }
+    } else if (candidate.pedestal_index !== trigger.pedestal_index) {
       return invalid(
         'state_invalid',
-        `candidates[${index}].pedestal_index 与 trigger.pedestal_index 不一致`,
+        `candidates[${index}].pedestal_index 必须等于 trigger.pedestal_index`,
       )
     }
     if (candidate.name !== null && !isNonEmptyString(candidate.name, 128)) {
@@ -918,6 +1220,7 @@ function assertDecisionLegal(doc, state) {
   if (decision.reason !== null) {
     if (typeof decision.reason !== 'string') fail('reason 类型')
     if (Array.from(decision.reason).length > MAX_REASON_CHARS) fail('reason 超长')
+    if (byteLength(decision.reason) > MAX_REASON_BYTES) fail('reason 超过 UTF-8 字节上限')
     if (/[\u0000-\u001f\u007f-\u009f]/.test(decision.reason)) fail('reason 含控制字符')
   }
   if (!providerSourceMatches(decision.provider_id, decision.source)) fail('provider_id 与 source 不匹配')
@@ -1108,20 +1411,23 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
   }
 
   const validation = validateStateDoc(state)
-  if (!validation.ok) {
-    if (validation.fatal) {
-      // protocol §2.8 / §7.3：信封不可读或 major 不兼容时不得猜测身份、不得写 decision。
-      return {
-        ok: false,
-        text: `[${validation.errorCode}/${validation.reasonCode}] 不写 decision：${validation.message}`,
-        error_code: validation.errorCode,
-        reason_code: validation.reasonCode,
-        message: validation.message,
-        written: false,
-        state_source: stateSource,
-      }
+  if (!validation.ok && validation.fatal) {
+    // protocol §2.8 / §7.3：信封不可读或 major 不兼容时不得猜测身份、不得写 decision。
+    return {
+      ok: false,
+      text: `[${validation.errorCode}/${validation.reasonCode}] 不写 decision：${validation.message}`,
+      error_code: validation.errorCode,
+      reason_code: validation.reasonCode,
+      message: validation.message,
+      written: false,
+      state_source: stateSource,
     }
+  }
 
+  // 只要信封可读就登记为“这一层的最新请求”；之后的旧结果会被发布闸门丢弃。
+  registerRequest(state)
+
+  if (!validation.ok) {
     // body 不合法：发布 valid:false 的拒绝决策，让 mod 立刻走本地规则。
     const rejection = {
       choice: { type: 'action', action: 'skip' },
@@ -1138,7 +1444,14 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
         reasonCode: validation.reasonCode,
         elapsedMs: elapsed(),
       })
-      await writeDecisionAtomic(bridgeDir, doc)
+      const published = await publishDecision({ bridgeDir, state, stateSource, doc, ctx })
+      if (!published.written) {
+        return discardedResult(state, published, {
+          elapsedMs: elapsed(),
+          stateSource,
+          stateMtimeMs,
+        })
+      }
       return {
         ok: true,
         text: `[拒绝/${validation.reasonCode}] ${validation.message}\ndecision=${doc.decision_id} written=decision.json valid=false`,
@@ -1177,7 +1490,14 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
         reasonCode: guardRule.reasonCode,
         elapsedMs: elapsed(),
       })
-      await writeDecisionAtomic(bridgeDir, doc)
+      const published = await publishDecision({ bridgeDir, state, stateSource, doc, ctx })
+      if (!published.written) {
+        return discardedResult(state, published, {
+          elapsedMs: elapsed(),
+          stateSource,
+          stateMtimeMs,
+        })
+      }
       return {
         ok: true,
         text: `[安全跳过/${guardRule.reasonCode}] ${guardRule.reason}\ndecision=${doc.decision_id} written=decision.json fallback=true`,
@@ -1222,7 +1542,21 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
           elapsedMs: elapsed(),
         },
       )
-      await writeDecisionAtomic(bridgeDir, doc)
+      const published = await publishDecision({
+        bridgeDir,
+        state,
+        stateSource,
+        doc,
+        ctx,
+        requireFresh: cause.requireFresh === true,
+      })
+      if (!published.written) {
+        return discardedResult(state, published, {
+          elapsedMs: elapsed(),
+          stateSource,
+          stateMtimeMs,
+        })
+      }
       return {
         ok: true,
         text: `[兜底/${reasonCode}] ${doc.decision.reason}\ndecision=${doc.decision_id} written=decision.json source=rule fallback=true`,
@@ -1300,6 +1634,7 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
     return finishWithFallback({
       errorCode: isaacError.errorCode,
       reasonCode: isaacError.reasonCode,
+      requireFresh: true,
     })
   }
 
@@ -1313,7 +1648,21 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
       reasonCode: null,
       elapsedMs: elapsed(),
     })
-    await writeDecisionAtomic(bridgeDir, doc)
+    const published = await publishDecision({
+      bridgeDir,
+      state,
+      stateSource,
+      doc,
+      ctx,
+      requireFresh: true,
+    })
+    if (!published.written) {
+      return discardedResult(state, published, {
+        elapsedMs: elapsed(),
+        stateSource,
+        stateMtimeMs,
+      })
+    }
     return {
       ok: true,
       text: `[llm] ${describeChoice(doc.decision.choice, state)} — ${doc.decision.reason ?? '(无理由)'}\n`
@@ -1457,11 +1806,18 @@ export const __testing = {
   STALE_AFTER_MS,
   MAX_STATE_BYTES,
   MAX_DECISION_BYTES,
+  MAX_REASON_BYTES,
+  PLUGIN_CAPABILITIES,
   resolveBridgeDir,
   safeFilePath,
   readStateFile,
   readTextWithRetry,
   writeDecisionAtomic,
+  ensureRealBridgeDir,
+  resetPublishStateForTest,
+  registerRequest,
+  evaluatePublishGate,
+  publishDecision,
   validateStateDoc,
   pickByLocalRules,
   parseModelJson,
