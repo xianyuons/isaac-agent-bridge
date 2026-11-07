@@ -190,3 +190,9 @@ npm --prefix plugin test
 ```
 
 预期：`node --check` 退出 0；测试 `111 passed, 0 failed`，退出 0。
+
+---
+
+## 7. t18 后续：draft.5 字段补齐
+
+t18 在本分支基础上补齐 `decision.session_id` 回显与 `plugin_status.json`，测试扩到 **157 项**（原 111 + 46）。完整「已实现/未实现」清单见 [draft5-plugin-fields.md](draft5-plugin-fields.md)。本文件 §1 的 D1–D6 仍适用。
