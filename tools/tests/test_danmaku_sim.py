@@ -78,6 +78,12 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(score["lao"], 2.5)
         self.assertEqual(score["shuang"], 0.0)
 
+    def test_stopwords_do_not_score(self) -> None:
+        self.assertEqual(sim.score_text("牢固")["lao"], 0.0)
+        self.assertEqual(sim.score_text("稳定版")["steady"], 0.0)
+        self.assertEqual(sim.score_text("贪吃蛇")["greedy"], 0.0)
+        self.assertEqual(sim.score_text("爽约")["shuang"], 0.0)
+
 
 class AggregateTests(unittest.TestCase):
     def test_fixture_is_stable(self) -> None:

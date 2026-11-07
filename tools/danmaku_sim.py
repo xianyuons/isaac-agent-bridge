@@ -127,6 +127,9 @@ INTENSIFIERS: tuple[str, ...] = tuple(
 )
 WEAKENERS: tuple[str, ...] = tuple(sorted(("一点点", "稍微", "有点", "些许", "略"), key=len, reverse=True))
 
+# 常见误伤词：先整词剔除，避免“牢固”命中“牢”、“贪吃蛇”命中“贪”。
+STOPWORDS: tuple[str, ...] = ("牢固", "牢靠", "稳定版", "贪吃蛇", "爽约")
+
 URL_RE = re.compile(r"(https?://|www\.|b23\.tv)", re.IGNORECASE)
 MENTION_RE = re.compile(r"@\S+")
 NUMBER_RE = re.compile(r"\d{6,}")
@@ -228,6 +231,10 @@ def _context_factor(text: str, index: int) -> tuple[float, bool]:
 
 def score_text(text: str) -> dict[str, float]:
     """按词表给一条弹幕打分；一个词只计一次，长词优先。"""
+    for stopword in STOPWORDS:
+        if stopword in text:
+            text = text.replace(stopword, " " * len(stopword))
+
     scores: dict[str, float] = {dimension: 0.0 for dimension in DIMENSIONS}
     consumed = [False] * len(text)
 
