@@ -970,17 +970,32 @@ end
 local function build_candidates(pool_name)
     local pool_id = POOL_IDS[pool_name] or 0
     local use_pool = pool_membership_supported()
-    local ids = {}
-    local maxId = max_collectible_id()
-    for id = 1, maxId do
-        if is_valid_collectible(id) then
-            local cfg = get_item_config(id)
-            if cfg ~= nil and item_available(cfg) and not is_quest_item(cfg) then
-                if (not use_pool) or in_pool(id, pool_id) then
-                    ids[#ids + 1] = id
+
+    local function scan(use_filter)
+        local ids = {}
+        local maxId = max_collectible_id()
+        for id = 1, maxId do
+            if is_valid_collectible(id) then
+                local cfg = get_item_config(id)
+                if cfg ~= nil and item_available(cfg) and not is_quest_item(cfg) then
+                    if (not use_filter) or in_pool(id, pool_id) then
+                        ids[#ids + 1] = id
+                    end
                 end
             end
         end
+        return ids
+    end
+
+    local ids = scan(use_pool)
+    if use_pool and #ids == 0 then
+        -- 池成员 API 存在但返回空集：多半是签名/参数顺序不同。宁可退化成全表，
+        -- 也不能让候选池为空（空池 = 永远不替换，且规则只能 skip）。
+        S.pool_api = false
+        use_pool = false
+        log_limited("warn", "candidates", "pool_api_empty",
+            "池成员 API 返回空集（疑似签名不同）→ 回退为全表合法道具")
+        ids = scan(false)
     end
     ids = sample_candidates(ids, MAX_CANDIDATES, pool_name .. "|" .. tostring(S.level.floor))
     local out = {}
