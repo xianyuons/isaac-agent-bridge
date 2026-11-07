@@ -18,7 +18,7 @@
  * 协议版本：1.0（major=1）。跨 major 时按 protocol §7.3 不写 decision，直接报错。
  */
 
-import { promises as fsp } from 'node:fs'
+import { promises as fsp, readFileSync, realpathSync, unlinkSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
@@ -40,7 +40,8 @@ const DEFAULT_BRIDGE_DIR_NAME = 'IsaacAgent'
 const STATE_FILE = 'state.json'
 const DECISION_FILE = 'decision.json'
 const PLUGIN_STATUS_FILE = 'plugin_status.json'
-const BRIDGE_FILES = new Set([STATE_FILE, DECISION_FILE, PLUGIN_STATUS_FILE])
+const LOCK_FILE = 'bridge.lock'
+const BRIDGE_FILES = new Set([STATE_FILE, DECISION_FILE, PLUGIN_STATUS_FILE, LOCK_FILE])
 
 const STALE_AFTER_MS = 30_000
 const DEFAULT_VALIDITY_MS = 1500
@@ -72,6 +73,7 @@ const DECISION_ID_RE = /^[A-Za-z0-9_-]{8,64}$/
 const GEN_LEVEL_KEY_RE = /^[A-Za-z0-9_.:-]{1,128}$/
 const PROTOCOL_VERSION_RE = /^\d+\.\d+(\.\d+)?$/
 const PROVIDER_ID_RE = /^[a-z][a-z0-9_.:-]{2,63}$/
+const KNOWN_PROVIDER_PREFIXES = new Set(['llm', 'rule', 'viewer', 'preset'])
 
 const SYSTEM_PROMPT = [
   '你是《以撒的结合》（The Binding of Isaac）的道具决策助手，为一次即将发生的道具生成做选择。',
@@ -463,6 +465,191 @@ async function writePluginStatusAtomic(bridgeDir, doc) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// bridge.lock（protocol §1.10）：跨进程单写者
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LOCK_TTL_MS = 30_000
+const LOCK_HEARTBEAT_MS = 5_000
+const PROCESS_STARTED_AT = Date.now() - Math.floor(process.uptime() * 1000)
+
+const lockState = {
+  held: false,
+  dir: null,
+  startedAt: null,
+  timer: null,
+}
+
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM 表示进程存在但无权限发信号。
+    return error?.code === 'EPERM'
+  }
+}
+
+function lockPayload(startedAt, heartbeatAt = Date.now()) {
+  return JSON.stringify({
+    pid: process.pid,
+    started_at: startedAt,
+    heartbeat_at: heartbeatAt,
+    plugin_version: PLUGIN_VERSION,
+  })
+}
+
+async function createLockFile(file) {
+  const handle = await fsp.open(file, 'wx', 0o600)
+  const startedAt = PROCESS_STARTED_AT
+  try {
+    await handle.writeFile(lockPayload(startedAt), 'utf8')
+    await handle.sync()
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+  return startedAt
+}
+
+function startLockHeartbeat(realDir) {
+  if (lockState.timer) clearInterval(lockState.timer)
+  lockState.timer = setInterval(() => {
+    writeLockHeartbeat(realDir).catch(() => undefined)
+  }, LOCK_HEARTBEAT_MS)
+  lockState.timer.unref?.()
+}
+
+function adoptLock(realDir, startedAt) {
+  lockState.held = true
+  lockState.dir = realDir
+  lockState.startedAt = startedAt
+  startLockHeartbeat(realDir)
+}
+
+async function writeLockHeartbeat(realDir) {
+  if (!lockState.held || !isSamePath(lockState.dir, realDir)) return
+  const file = await safeFilePath(realDir, LOCK_FILE)
+  const raw = await fsp.readFile(file, 'utf8').catch(() => null)
+  if (!raw) return
+  let current
+  try {
+    current = JSON.parse(raw)
+  } catch {
+    return
+  }
+  if (current?.pid !== process.pid) return
+  await fsp.writeFile(file, lockPayload(lockState.startedAt ?? Date.now()), 'utf8')
+}
+
+/**
+ * 独占获取 `<bridge>/bridge.lock`。
+ * 返回 {ok:true,dir} 或 {ok:false,reason:'lock_held',owner_pid}。
+ * 锁内容：pid + started_at + heartbeat_at + plugin_version；心跳 5s，TTL 30s。
+ */
+async function ensureBridgeLock(bridgeDir) {
+  const realDir = await ensureRealBridgeDir(bridgeDir)
+
+  if (lockState.held && isSamePath(lockState.dir, realDir)) {
+    await writeLockHeartbeat(realDir).catch(() => undefined)
+    return { ok: true, dir: realDir }
+  }
+  if (lockState.held) await releaseBridgeLock()
+
+  const file = await safeFilePath(realDir, LOCK_FILE)
+  try {
+    const startedAt = await createLockFile(file)
+    adoptLock(realDir, startedAt)
+    return { ok: true, dir: realDir }
+  } catch (error) {
+    if (error?.code !== 'EEXIST') {
+      throw new IsaacError('IO', 'io_error', '无法创建 bridge.lock')
+    }
+  }
+
+  let existing = null
+  // 锁文件在 open('wx') 后、写入内容前有一个极短的空窗；给对方一点时间写完，
+  // 不能把“刚创建但还没写入”的空文件当僵死锁抢走。
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      existing = JSON.parse(await fsp.readFile(file, 'utf8'))
+    } catch {
+      existing = null
+    }
+    if (existing && Number.isInteger(existing.pid)) break
+    await sleep(25)
+  }
+  if (!existing) {
+    const stat = await fsp.stat(file).catch(() => null)
+    if (stat && Date.now() - stat.mtimeMs < 2_000) {
+      return { ok: false, reason: 'lock_held' }
+    }
+  }
+
+  // 同一进程的旧锁（模块重载/热更新）直接接管。
+  if (existing && existing.pid === process.pid) {
+    adoptLock(realDir, isInt(existing.started_at, 0, Number.MAX_SAFE_INTEGER) ? existing.started_at : Date.now())
+    return { ok: true, dir: realDir }
+  }
+
+  const alive = existing && processAlive(existing.pid)
+  const heartbeatFresh = existing
+    && isInt(existing.heartbeat_at, 0, Number.MAX_SAFE_INTEGER)
+    && Date.now() - existing.heartbeat_at <= LOCK_TTL_MS
+
+  if (alive && heartbeatFresh) {
+    return { ok: false, reason: 'lock_held', owner_pid: existing.pid }
+  }
+
+  // 僵死/过期锁可抢占；先删再独占创建，避免两个抢占者同时成功。
+  await fsp.rm(file, { force: true }).catch(() => undefined)
+  try {
+    const startedAt = await createLockFile(file)
+    adoptLock(realDir, startedAt)
+    return { ok: true, dir: realDir }
+  } catch {
+    return { ok: false, reason: 'lock_held' }
+  }
+}
+
+async function releaseBridgeLock() {
+  const dir = lockState.dir
+  if (!lockState.held) return
+  lockState.held = false
+  if (lockState.timer) {
+    clearInterval(lockState.timer)
+    lockState.timer = null
+  }
+  if (!dir) return
+  try {
+    const real = await fsp.realpath(dir).catch(() => null)
+    if (!real || !isSamePath(real, dir)) return
+    const file = await safeFilePath(real, LOCK_FILE)
+    const raw = await fsp.readFile(file, 'utf8').catch(() => null)
+    if (!raw) return
+    const current = JSON.parse(raw)
+    if (current?.pid === process.pid) await fsp.rm(file, { force: true })
+  } catch {
+    // 释放失败留给 TTL 抢占；不得因清理失败阻塞进程退出。
+  }
+}
+
+function releaseBridgeLockSync() {
+  if (!lockState.held || !lockState.dir) return
+  try {
+    const real = realpathSync(lockState.dir)
+    if (!isSamePath(real, lockState.dir)) return
+    const file = path.join(real, LOCK_FILE)
+    const current = JSON.parse(readFileSync(file, 'utf8'))
+    if (current?.pid !== process.pid) return
+    unlinkSync(file)
+  } catch {
+    // 锁文件可能已不存在/目录已卸载。
+  }
+}
+
+process.once('exit', releaseBridgeLockSync)
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 发布闸门：R1/R2 竞态 + 消费一次即作废
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -793,8 +980,10 @@ function buildPluginStatusDoc() {
       last_failure_ts: statusState.lastFailureTs,
       error_code_counts: { ...statusState.errorCounts },
       bridge_dir: statusState.bridgeDir,
-      lock_held: statusState.lockHeld,
-      lock_mode: 'process-local',
+      lock_held: lockState.held,
+      lock_mode: lockState.held ? 'file+process-local' : 'none',
+      lock_pid: lockState.held ? process.pid : null,
+      lock_heartbeat_at: lockState.held ? Date.now() : null,
     },
   }
 }
@@ -830,11 +1019,11 @@ async function noteToolResult(config, result, { bridgeDir, model } = {}) {
       // 正常 llm / 安全跳过（player_dead、no_candidate）都算健康。
       markStatusSuccess()
     }
-  } else if (result?.discarded === true) {
-    // 迟到/被更新请求取代不是插件故障；保持当前 status，只刷新 ts。
   } else if (result && result.ok === false) {
     const refused = result.error_code === 'VALIDATION'
     markStatusFailure(result.error_code, result.reason_code, { refused })
+  } else if (result?.discarded === true) {
+    // 迟到/被更新请求取代不是插件故障；保持当前 status，只刷新 ts。
   }
 
   const written = await refreshPluginStatus(config, statusState.bridgeDir)
@@ -1419,11 +1608,22 @@ async function requestModelDecision({ llm, selection, state, intent, viewer, dea
 // decision.json 组装与自检
 // ─────────────────────────────────────────────────────────────────────────────
 
-function providerSourceMatches(providerId, source) {
-  if (!PROVIDER_ID_RE.test(providerId)) return false
+function providerInfo(providerId) {
+  if (!PROVIDER_ID_RE.test(providerId)) return { ok: false, known: false, prefix: null }
   const prefix = providerId.split(':')[0]
-  if (source === 'llm') return prefix === 'llm'
-  return prefix === 'rule' || prefix === 'viewer' || prefix === 'preset'
+  return { ok: true, known: KNOWN_PROVIDER_PREFIXES.has(prefix), prefix }
+}
+
+/**
+ * 已知前缀必须与 source 一致；未知前缀按「不认识的 provider」接受（§3.5 / A34），
+ * 由 `x_provider_unknown` 标记，供日志/UI 提示，不把决策判废。
+ */
+function providerSourceMatches(providerId, source) {
+  const info = providerInfo(providerId)
+  if (!info.ok) return false
+  if (!info.known) return true
+  if (source === 'llm') return info.prefix === 'llm'
+  return info.prefix === 'rule' || info.prefix === 'viewer' || info.prefix === 'preset'
 }
 
 /**
@@ -1463,7 +1663,19 @@ function assertDecisionLegal(doc, state) {
     if (byteLength(decision.reason) > MAX_REASON_BYTES) fail('reason 超过 UTF-8 字节上限')
     if (/[\u0000-\u001f\u007f-\u009f]/.test(decision.reason)) fail('reason 含控制字符')
   }
-  if (!providerSourceMatches(decision.provider_id, decision.source)) fail('provider_id 与 source 不匹配')
+  const provider = providerInfo(decision.provider_id)
+  if (!provider.ok) fail('provider_id 格式非法')
+  if (provider.known) {
+    if (!providerSourceMatches(decision.provider_id, decision.source)) {
+      fail('provider_id 与 source 不匹配')
+    }
+  } else {
+    if (doc.x_provider_unknown !== undefined && doc.x_provider_unknown !== provider.prefix) {
+      fail('x_provider_unknown 与 provider_id 前缀不一致')
+    }
+    // 未知 provider：接受但标记，供表现层/统计区分。
+    doc.x_provider_unknown = provider.prefix
+  }
 
   if (doc.valid === false) {
     if (doc.error_code === null) fail('valid:false 但 error_code 为 null')
@@ -1586,6 +1798,15 @@ function errorResult(error, context) {
   }
 }
 
+/** 写盘失败：不抛异常，明确标记 discarded；旧文件由原子写保证保持不动。 */
+function writeFailureResult(error, context) {
+  return {
+    ...errorResult(error, context),
+    discarded: true,
+    discard_reason: 'write_failed',
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 工具实现
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1638,6 +1859,28 @@ async function runIsaacDecideInner({ config, ctx, args, exec }) {
   try {
     bridgeDir = await resolveBridgeDir(config)
     statusState.bridgeDir = bridgeDir
+
+    const sourceHint = args?.state !== undefined ? 'inline' : 'file'
+    let lock
+    try {
+      lock = await ensureBridgeLock(bridgeDir)
+    } catch (error) {
+      return errorResult(error, '获取 bridge.lock 失败')
+    }
+    if (!lock.ok) {
+      const owner = lock.owner_pid ? ` pid=${lock.owner_pid}` : ''
+      return {
+        ok: false,
+        text: `[IO/bridge_unavailable] bridge.lock 被其它进程持有${owner}；降级不写 decision`,
+        written: false,
+        discarded: true,
+        discard_reason: 'lock_held',
+        error_code: 'IO',
+        reason_code: 'bridge_unavailable',
+        message: `bridge.lock 被其它进程持有${owner}`,
+        state_source: sourceHint,
+      }
+    }
 
     if (args?.state !== undefined) {
       stateSource = 'inline'
@@ -1724,7 +1967,7 @@ async function runIsaacDecideInner({ config, ctx, args, exec }) {
         state_source: stateSource,
       }
     } catch (error) {
-      return errorResult(error, '写拒绝决策失败')
+      return writeFailureResult(error, '写拒绝决策失败')
     }
   }
 
@@ -1772,7 +2015,7 @@ async function runIsaacDecideInner({ config, ctx, args, exec }) {
         state_mtime_ms: stateMtimeMs,
       }
     } catch (error) {
-      return errorResult(error, '写安全跳过决策失败')
+      return writeFailureResult(error, '写安全跳过决策失败')
     }
   }
 
@@ -1834,7 +2077,7 @@ async function runIsaacDecideInner({ config, ctx, args, exec }) {
         state_mtime_ms: stateMtimeMs,
       }
     } catch (error) {
-      return errorResult(error, '写兜底决策失败')
+      return writeFailureResult(error, '写兜底决策失败')
     }
   }
 
@@ -1947,7 +2190,7 @@ async function runIsaacDecideInner({ config, ctx, args, exec }) {
     }
   } catch (error) {
     // 写盘失败必须显式：不谎报 llm 成功。
-    return errorResult(error, '写 llm 决策失败')
+    return writeFailureResult(error, '写 llm 决策失败')
   }
 }
 
@@ -1998,6 +2241,16 @@ export function apply(root, config) {
 
   // 启动即写一次 plugin_status（尽力而为；失败不影响工具注册）。
   void refreshPluginStatus(pluginConfig)
+
+  // 启动即尝试持锁（protocol §1.10）；拿不到也继续注册工具，具体写入时再判。
+  void (async () => {
+    try {
+      const dir = await resolveBridgeDir(pluginConfig)
+      await ensureBridgeLock(dir)
+    } catch {
+      // 目录尚未就绪/锁被占用：保留给首次工具调用重试。
+    }
+  })()
 
   root.inject(['tools'], (ctx) => {
     ctx.tools.register({
@@ -2080,6 +2333,8 @@ export const __testing = {
   MAX_REASON_BYTES,
   PLUGIN_CAPABILITIES,
   PLUGIN_STATUS_FILE,
+  LOCK_FILE,
+  LOCK_TTL_MS,
   resolveBridgeDir,
   safeFilePath,
   readStateFile,
@@ -2090,6 +2345,11 @@ export const __testing = {
   refreshPluginStatus,
   resetStatusStateForTest,
   ensureRealBridgeDir,
+  ensureBridgeLock,
+  releaseBridgeLock,
+  lockState,
+  providerInfo,
+  providerSourceMatches,
   assertDecisionLegal,
   resetPublishStateForTest,
   registerRequest,
