@@ -1205,7 +1205,8 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
     const rule = pickByLocalRules(state.state)
     const reasonCode = cause.reasonCode ?? 'model_error'
     const errorCode = cause.errorCode ?? 'MODEL'
-    const suffix = errorCode === 'TIMEOUT' ? '模型未及时返回，已按本地规则兜底' : '模型不可用，已按本地规则兜底'
+    const suffix = cause.note
+      ?? (errorCode === 'TIMEOUT' ? '模型未及时返回，已按本地规则兜底' : '模型不可用，已按本地规则兜底')
     const reason = sanitizeReason(`${rule.reason}；${suffix}`)
     try {
       const doc = makeDecisionDoc(
@@ -1250,6 +1251,7 @@ async function runIsaacDecide({ config, ctx, args, exec }) {
     return finishWithFallback({
       errorCode: state.error_code,
       reasonCode: state.reason_code ?? 'state_invalid',
+      note: '局面降级，已按本地规则兜底',
     })
   }
 
