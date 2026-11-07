@@ -1,4 +1,4 @@
-# isaac-agent-bridge
+﻿# isaac-agent-bridge
 
 An agent-driven item picker for **The Binding of Isaac: Repentance+**, split into two
 independent halves:
@@ -14,7 +14,7 @@ access from the mod.
 
 > **Status: offline-verified, not smoke-tested on a real game install.**
 > Contract: `docs/protocol.md` **v1.0-draft.5** (wire version `1.0`). The Lua logic is
-> covered by 133 offline assertions, the plugin by 157 offline assertions, and the JSON
+> covered by 162 offline assertions, the plugin by 218 offline assertions, and the JSON
 > contract by `tools/mock_e2e.py` (4 scenarios / 87 assertions). The author's machine does
 > not have REPENTOGON installed, so **no end-to-end run inside the actual game has been
 > performed yet**. Treat this as a working prototype, not a polished release.
@@ -278,11 +278,11 @@ logs keys or full absolute paths.
 ## Testing (offline, no game required)
 
 ```powershell
-# 1) Lua mod logic — 133 assertions; runner supports Lua 5.1–5.4 via lupa
+# 1) Lua mod logic — 162 assertions; runner supports Lua 5.1–5.4 via lupa
 python tests/run_lua_test.py
 $env:ISAAC_AGENT_LUA = "53"; python tests/run_lua_test.py   # game-like runtime
 
-# 2) plugin regression — 157 assertions (no DSH process, no network)
+# 2) plugin regression — 218 assertions (no DSH process, no network)
 node plugin/tests/plugin.test.mjs
 
 # 3) end-to-end JSON contract — 4 scenarios, 87 assertions
@@ -313,7 +313,7 @@ build (e.g. an older plugin to confirm the tightened checks actually go red).
 and prints the four tendency weights; it never opens a network connection and never writes
 viewer text to disk. See [docs/danmaku.md](docs/danmaku.md).
 
-The plugin now ships its own regression suite: `node plugin/tests/plugin.test.mjs` (157 assertions, no DSH process or network needed).
+The plugin now ships its own regression suite: `node plugin/tests/plugin.test.mjs` (218 assertions, no DSH process or network needed).
 
 ---
 
@@ -417,8 +417,8 @@ Profile C（SaveData 中继）推迟到 v1.1+，v1 不实现、也不得声称�
 ## 测试
 
 ```powershell
-python tests/run_lua_test.py     # Lua 逻辑 133 条断言
-node plugin/tests/plugin.test.mjs # 插件回归 157 条断言（不需要 DSH 进程/网络）
+python tests/run_lua_test.py     # Lua 逻辑 162 条断言
+node plugin/tests/plugin.test.mjs # 插件回归 218 条断言（不需要 DSH 进程/网络）
 python tools/mock_e2e.py         # 四种场景的 mock 联调，87 条断言
 python tools/danmaku_sim.py      # 弹幕倾向离线模拟（固定 32 条样例，不联网）
 python -m unittest discover -s tools/tests -p "test_*.py"
@@ -452,6 +452,7 @@ python -m unittest discover -s tools/tests -p "test_*.py"
 ## 许可
 
 [MIT](LICENSE)。
+
 
 
 
