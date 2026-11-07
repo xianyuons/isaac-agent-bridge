@@ -1,0 +1,20 @@
+# dsh-isaac-agent 的 bundle patch —— 把以撒桥接工具挂进 DSH 配置树
+#
+# DSH 启动时按 bundle 层栈把各插件的 patch 叠起来组成配置树：
+#   insert: 往配置树里加一行 entry
+#   id:     这一行的唯一标识
+#   name:   'dsh-isaac-agent' 解析到本包入口 index.js（宿主半侧）
+#   config: 传给 apply(root, config) 的配置，全部可选
+#
+# 桥目录默认 %LOCALAPPDATA%\IsaacAgent；测试/多存档时可覆盖：
+#   config:
+#     bridgeDir: 'D:\IsaacBridge'
+# 模型默认跟随当前会话（agent.model.current()）；需要固定路由时再加：
+#     provider: deepseek
+#     model: deepseek-chat
+#
+# 注意：这里不写任何 API key。key 只存在于 DSH 的 LLM 凭据存储中。
+
+- insert:
+    - id: isaac-agent
+      name: 'dsh-isaac-agent'

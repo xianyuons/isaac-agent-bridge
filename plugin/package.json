@@ -1,0 +1,29 @@
+{
+  "name": "dsh-isaac-agent",
+  "version": "0.1.0",
+  "description": "DSH side of the Isaac agent bridge: read state.json and let the current model choose a candidate item (decision.json).",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "win32",
+    "linux",
+    "darwin"
+  ],
+  "license": "MIT"
+}
