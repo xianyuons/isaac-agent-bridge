@@ -35,6 +35,64 @@
 - 两维分开，才能保住“每次抽取恰好落一个分类”的不变量；否则每加一个 provider 就要动 `source` 枚举，历史 `applied.json` 的统计口径全部作废。
 - **误用警告**：实现方 **不得** 用 `provider_id` 判断“是否兜底”。兜底只看 `fallback` / `applied_by`；`provider_id` 只做来源标注与展示。
 
+### 0.2 English Summary (protocol v1.0-draft.3)
+
+This document defines the local file bridge between a REPENTOGON Lua mod (game side) and a
+DSH plugin (agent side) for *The Binding of Isaac: Repentance+*. The game only describes
+its situation; the agent only chooses from the game's candidate pool. Neither side may
+invent state or bypass the contract.
+
+**Documents and keys.** Four UTF-8, BOM-less, strict-JSON files live in one bridge
+directory (default `%LOCALAPPDATA%\IsaacAgent`): `state.json` (mod → plugin), `event.json`
+(mod → consumers, latest-wins notifications), `applied.json` (mod → consumers, the final
+outcome) and `decision.json` (plugin → mod). `request_id` correlates a state with its
+decision; `decision_id` identifies each decision for audit; `gen_level_key` pins both to one
+generation context so a stale room/floor choice can never be reused.
+
+**Timing.** `validity_ms` (default 1500; 5000–10000 for boss-reward prefetch) is the
+decision's freshness window, *not* a blocking wait. The mod never sleeps or reads disk
+inside a game callback. `MC_PRE_GET_COLLECTIBLE` (callback 62, after pool selection and
+before the pedestal entity exists) must return in the same frame from memory: it either
+returns a still-eligible decision's `item_id` or applies the deterministic local rule.
+
+**Decision semantics.** A decision is executable only when `valid:true` and either
+`source:"llm"` with `fallback:false,error_code:null`, or `source:"rule"` with
+`fallback:true` and an error code (or a safe skip: `no_candidate` / `player_dead`).
+`valid:false` is a refusal document: the mod must not execute its `skip`; it runs local
+rules instead. `source` is exactly `llm` or `rule`; viewer votes and preset policies are
+`rule` with a `provider_id` prefix (`viewer:*`, `preset:*`). Prefix/source mismatches are
+rejected. Five error classes only: `IO`, `TIMEOUT`, `VALIDATION`, `MODEL`, `INTERNAL`, each
+with a registered `reason_code`; unknown reason codes are tolerated rather than rejected.
+
+**Fallback.** Every failure maps to exactly one outcome and leaves explicit evidence:
+a fallback decision, an `applied.json` receipt (`applied_by`: `llm` / `provider` /
+`fallback` / `none`), a readable reason, and an on-screen bubble. The local rule v1 is
+shared by both ends: dead → skip; empty pool → skip; zero red hearts with a heal candidate →
+heal; no damage item and a damage candidate → damage; otherwise the first candidate by
+`pedestal_index`, then array order, then `item_id`. Silence is a protocol violation.
+
+**Refresh and consumption.** Several requests (same `gen_level_key`, new `request_id`) may
+be issued while waiting for generation (§6.7). A result computed for R1 may be published
+against the newest request R2, but always with a new `decision_id`; if the situation
+fingerprint changed, it must be recomputed. One generation consumes exactly one choice;
+afterwards every decision for that key is void. Late decisions are dropped, never applied.
+
+**Versioning.** `MAJOR.MINOR[.PATCH]`; major changes require a codec (current major or a
+retained N−1 reader) or an explicit refusal, and a refusal must never guess identity. Minor
+changes may only add optional fields/capabilities; behaviour is gated by `features` /
+`requires`, never by version comparison. Both ends must ignore unknown fields.
+
+**Security.** No network access from the mod; no API key in the game, bridge files, logs or
+`reason` text (keys stay in DSH). Only local JSON in the bridge directory is read or
+written; path traversal, symlinks and relative paths are rejected. Model output is data,
+never code or a path; no input injection or memory editing. `reroll` is not allowed inside
+callback 62.
+
+**Out of scope in v1.** No decision queue (one active generation target, latest-wins), no
+complete audit log (`applied.json` is the last receipt), no reliable event bus (file events
+may be lost), no real-time agent in a read-only profile, and no map/enemy export. See §11
+for the full list of known trade-offs and §10 for byte-stable examples.
+
 ---
 
 ## 1. 通用约定
