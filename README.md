@@ -14,7 +14,7 @@ access from the mod.
 
 > **Status: offline-verified, not smoke-tested on a real game install.**
 > Contract: `docs/protocol.md` **v1.0-draft.5** (wire version `1.0`). The Lua logic is
-> covered by 106 offline assertions, the plugin by 111 offline assertions, and the JSON
+> covered by 133 offline assertions, the plugin by 111 offline assertions, and the JSON
 > contract by `tools/mock_e2e.py` (4 scenarios / 52 assertions). The author's machine does
 > not have REPENTOGON installed, so **no end-to-end run inside the actual game has been
 > performed yet**. Treat this as a working prototype, not a polished release.
@@ -278,7 +278,7 @@ logs keys or full absolute paths.
 ## Testing (offline, no game required)
 
 ```powershell
-# 1) Lua mod logic — 106 assertions; runner supports Lua 5.1–5.4 via lupa
+# 1) Lua mod logic — 133 assertions; runner supports Lua 5.1–5.4 via lupa
 python tests/run_lua_test.py
 $env:ISAAC_AGENT_LUA = "53"; python tests/run_lua_test.py   # game-like runtime
 
@@ -298,6 +298,12 @@ python -m unittest discover -s tools/tests -p "test_*.py"
 against `docs/protocol.md` for four cases: valid state, missing field, out-of-pool item id,
 and expired state. It prints a per-assertion PASS/FAIL and a four-scenario conclusion;
 exit code 0 means everything passed.
+
+> **Coverage boundary:** the mock covers the plugin and the JSON contract only. It does
+> **not** read or assert `applied.json` — that receipt is written by the game-side mod after
+> `POST_PICKUP_INIT` verification (it may legitimately not exist yet when generation
+> returns), and is covered by `tests/lua_logic_test.lua` instead. Do not assume a green mock
+> means applied/receipt behavior was exercised.
 
 `tools/danmaku_sim.py` runs the fixed 32-message fixture through filtering and aggregation
 and prints the four tendency weights; it never opens a network connection and never writes
@@ -407,12 +413,16 @@ Profile C（SaveData 中继）推迟到 v1.1+，v1 不实现、也不得声称�
 ## 测试
 
 ```powershell
-python tests/run_lua_test.py     # Lua 逻辑 106 条断言
+python tests/run_lua_test.py     # Lua 逻辑 133 条断言
 node plugin/tests/plugin.test.mjs # 插件回归 111 条断言（不需要 DSH 进程/网络）
 python tools/mock_e2e.py         # 四种场景的 mock 联调，52 条断言
 python tools/danmaku_sim.py      # 弹幕倾向离线模拟（固定 32 条样例，不联网）
 python -m unittest discover -s tools/tests -p "test_*.py"
 ```
+
+**覆盖边界**：mock 只覆盖插件与 JSON 契约，**不读也不断言 `applied.json`**——回执由 mod 在
+`POST_PICKUP_INIT` 核验后写（生成当帧可能还没有），这部分由 `tests/lua_logic_test.lua`
+覆盖。mock 全绿不代表 applied/回执行为已被验证。
 
 ## 现实边界（如实说明）
 
@@ -433,6 +443,7 @@ python -m unittest discover -s tools/tests -p "test_*.py"
 ## 许可
 
 [MIT](LICENSE)。
+
 
 
 
