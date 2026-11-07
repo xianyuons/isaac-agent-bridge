@@ -1,0 +1,9 @@
+<metadata>
+    <name>isaac_agent</name>
+    <directory>isaac_agent</directory>
+    <description>Game-side bridge for the isaac-agent-bridge project: exports state.json, consumes decision.json, and falls back to local rules (heal/damage) when no fresh decision exists. Requires REPENTOGON. No network access, no API key handling.
+
+协议见项目根 docs/protocol.md；本 mod 只读写桥目录内的 JSON，不联网、不读 key、不写注册表。</description>
+    <version>0.1.0</version>
+    <visibility>Private</visibility>
+</metadata>
