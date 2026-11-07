@@ -28,6 +28,13 @@
 | `valid=false` + `reasonCode` | `valid: false` + `reason_code` | 拒绝也是一份合法决策文档，不靠“choice 为空”表达 |
 | `source` 由理由是否为空推断 | 禁止 | 来源永远显式写在 `source` / `provider_id` / `fallback` |
 
+**为什么 `source` 只保留两值、把 viewer/preset 放进 `provider_id`（2026-11-07 与 captain 定稿）**：
+
+- `source` 回答的是“这次决策是**模型产生**还是**非模型产生**”——这是**可靠性维度**；以后加十个 provider，也只有这两种可靠性来源。“非模型”不等于“兜底”：主路径规则/预置/观众都是 `rule + fallback:false`。
+- `provider_id` 回答的是“谁给的”——这是**来源维度**，可以无限扩：`viewer:bilibili`、`preset:scripted`、`llm:local_small`。
+- 两维分开，才能保住“每次抽取恰好落一个分类”的不变量；否则每加一个 provider 就要动 `source` 枚举，历史 `applied.json` 的统计口径全部作废。
+- **误用警告**：实现方 **不得** 用 `provider_id` 判断“是否兜底”。兜底只看 `fallback` / `applied_by`；`provider_id` 只做来源标注与展示。
+
 ---
 
 ## 1. 通用约定
@@ -102,7 +109,8 @@ Profile B **不得** 假装 agent 可用，也 **不得** 无限等待；生成�
 - `decision_id`：`^[A-Za-z0-9_-]{8,64}$`，插件生成。同一请求即使重发决策，也 **必须** 是不同的 `decision_id`。
 - `gen_level_key`：`^[A-Za-z0-9_.:-]{1,128}$`，mod 生成，标识“这一层生成上下文”。至少覆盖：层数、房间（或道具池）、目标底座（池级预取时为目标池）、候选池内容签名；候选池重掷 **必须** 变化。示例：`f2:r84:treasure:p0:9c1e`。
 - `ts`：整数 Unix epoch 毫秒（UTC），仅用于展示/排序。**判定迟到与有效期一律使用本机单调时钟的接收时刻**，不比较 `ts`（避免时钟回拨与跨机偏差）。
-- `validity_ms`：整数，`300..10000`，默认 `1500`。含义：**从该 `request_id` 发出时刻起，该请求对应的决策在这么多毫秒内被接收才算“有效”**。超过即过期（`TIMEOUT` / `no_fresh_decision`）。它不是 mod 的阻塞时长。
+- `validity_ms`：整数，`300..10000`，默认 `1500`。含义：**从该 `request_id` 发出时刻起，到实际生成使用为止的窗口**。判定分两步且两步都必须满足：① 决策必须在窗口内被接收；② 生成时 `now - request_sent_at <= validity_ms`。任一不满足即过期（`TIMEOUT` / `late` / `no_fresh_decision`）。它不是 mod 的阻塞时长。
+- 插件计算预算时 **必须** 从 `state.ts` 起算：`remaining = state.ts + validity_ms - now - write_margin`（同机时钟），轮询与排队延迟因此计入；不得只按“插件收到 state 的时刻”重新给满 `validity_ms`。
 - mod **应该** 在等待生成/等待决策期间以 `validity_ms / 2` 为间隔刷新请求（同一 `gen_level_key`，新 `request_id`），使慢响应也有新鲜决策；插件 **应该** 对同一 `gen_level_key` 的在途 agent 调用去重（见架构文档）。
 - 同一请求收到多条有效决策时，mod 取 **接收时间最新** 的一条；旧决策被新决策覆盖。生成发生后到达的一律丢弃。
 
@@ -173,6 +181,7 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
   "ts": 1793982600000,
   "validity_ms": 1500,
   "error_code": null,
+  "reason_code": null,
   "features": ["transport:file_write", "hook:pre_get_collectible", "apply:prefetch", "action:reroll"],
   "requires": [],
   "trigger": {
@@ -193,7 +202,8 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
 | `ts` | integer | 是 | epoch ms，`0..9007199254740991` |
 | `validity_ms` | integer | 是 | `300..10000`，默认 1500 |
 | `error_code` | string \| null | 是 | 五类之一或 `null`；非 null 表示“局面降级”，见 §6.4 |
-| `features` | string[] | 否 | 本端支持的协议能力，informative；缺省视为 `[]` |
+| `reason_code` | string \| null | 是 | §3.6 注册表；有 `error_code` 时 **应该** 给出具体原因，无错误为 `null` |
+| `features` | string[] | 否 | 本端支持的协议能力，仅用于诊断/展示；**不得** 作为行为硬依赖，硬依赖写 `requires` |
 | `requires` | string[] | 否 | 本端要求对端具备的能力；对端缺任意一项 → 拒绝并兜底 |
 | `trigger.type` | string | 是 | `pedestal_spawn` / `room_enter` / `boss_approach` / `reroll` / `custom` |
 | `trigger.event_seq` | integer | 否 | `>= 1`，对应 `event.json.event_seq`；刷新请求沿用原事件序号 |
@@ -210,6 +220,8 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
 | --- | --- | --- | --- |
 | `red_hearts` | integer | 是 | `0..24`，单位 **半颗红心**（2 = 1 整颗） |
 | `soul_hearts` | integer | 是 | `0..24`，单位 **半颗魂心**；黑心暂并入此值，v1 不单列 |
+| `max_red_hearts` | integer | 否 | `0..24`，红心容器上限（半颗为单位）；缺省表示未知。为 `0` 表示该角色无法靠红心回复（Keeper/Blue Baby 等），规则不得把“红心为 0”当“缺红心” |
+| `character_id` | integer | 否 | `0..255`，Isaac `PlayerType`；缺省表示未知。用于角色相关判断（Keeper/堕化/无红心角色） |
 | `is_dead` | boolean | 否 | 默认 `false`；为 `true` 时只允许 `skip` |
 
 > 不使用“红心容器数”字段，避免“半心/整颗”两种单位混用。`red_hearts` 超过当前红心容器数的部分（如有 mod）按实际值导出，不超过 24。
@@ -318,7 +330,7 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
 | `gen_level_key` | string | 是 | **必须**与请求一致；不一致 mod 直接拒绝（`level_mismatch`） |
 | `ts` | integer | 是 | epoch ms |
 | `error_code` | string \| null | 是 | 五类之一或 `null`；非 null ⟹ `fallback = true` |
-| `features` | string[] | 否 | 本端支持能力 |
+| `features` | string[] | 否 | 本端支持能力，仅诊断/展示；硬依赖写 `requires` |
 | `requires` | string[] | 否 | 硬要求；mod 不认识任意一项 → 拒绝（`version_minor_feature`） |
 | `valid` | boolean | 是 | `false` = “我无法给出可用决策”，mod 走本地兜底；`true` 才是可执行决策 |
 | `decision.choice` | object | 是 | 见 §3.2；`valid:false` 时仍必须给 `skip` |
@@ -347,6 +359,7 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
 - 扩展动作 **必须** 先登记到能力表并通过 minor 发布；v1 不得出现其它字符串。
 - `skip` 的含义是“保持游戏状态不变”，不是“没想好”。
 - `reroll` 的含义是“请 mod 用官方 API 重掷目标底座的候选池”；mod 不支持时 **不得** 自行模拟，直接拒绝并兜底（`VALIDATION` / `invalid_action`）。
+- **`reroll` 不适用于生成回调（回调 62）**：该回调必须当帧返回 item id；在 `MC_PRE_GET_COLLECTIBLE` 里收到 `reroll` 一律按 `invalid_action` 拒绝，不执行。它只用于生成后的主动重掷阶段（若 mod 显式支持）。
 
 ### 3.3 合法性与约束
 
@@ -360,6 +373,15 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
 6. 决策 **不得** 包含任何密钥、账号、路径或可执行内容；`reason` 会直接显示在游戏内，**不得** 含任何控制字符（含换行/制表）。
 
 违反任一条 → mod 拒绝（`VALIDATION` + 对应 `reason_code`），继续等刷新/本地兜底。
+
+**`valid × fallback × error_code` 的执行真值表（两端必须一致）**：
+
+| `valid` | `fallback` | `error_code` | mod 是否执行 `choice` | 说明 |
+| --- | --- | --- | --- | --- |
+| `true` | `false` | `null` | 是 | 正常 llm/主路径 |
+| `true` | `true` | 非 null | 是 | 插件侧规则兜底，仍是一份可用决策 |
+| `true` | `true` | `null` | 是（仅 `no_candidate`/`player_dead` 的 skip） | 安全跳过 |
+| `false` | `true` | 非 null | **否** | 拒绝响应，mod 走本地规则，不执行其中的 skip |
 
 ### 3.4 部分响应
 
@@ -383,6 +405,7 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
 | 无法给出决策（拒绝） | `rule` | `true` | `rule:guard` | `fallback` |
 
 - **禁止**用 `reason` 是否为空、`confidence` 高低、`choice` 类型去反推来源；来源只看 `source` + `fallback` + `provider_id`。
+- **前缀交叉校验（必须）**：`llm:*` ⇔ `source="llm"`；`rule:*` / `viewer:*` / `preset:*` ⇔ `source="rule"`；其它前缀或前缀与 source 矛盾 → `VALIDATION` / `invalid_type`。这条防止“`source:llm` + `provider_id:rule:x`”污染统计。
 - 观众投票与预置策略都归 `rule`，因为它们是确定性聚合，不产生模型调用；渠道由 `provider_id` 保留，表现层可以显示“由 37 票选出”。
 - 每条决策 **恰好落一个分类**：不能同时是 llm 决策和 fallback 决策；`applied_by` 也只有一个值。
 
@@ -415,7 +438,7 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
 | `bridge_unavailable` | `IO` | 桥不可用（Profile B/探针失败） |
 | `internal_error` | `INTERNAL` | 其它未预期错误 |
 
-未登记的 `reason_code` → `VALIDATION` / `out_of_range`（日志里保留原值，便于排查）。
+未登记的 `reason_code` **不得** 导致整份文档被拒绝：读者保留原值、按 `error_code` 归类并记一条 WARN；只有结构/类型/范围非法才拒绝。这样 minor 增加原因码不会让旧端把新决策整份丢掉。
 
 ---
 
@@ -494,6 +517,8 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
 
 回答三个问题：**这次最后执行了什么**、**是 llm 还是兜底**、**为什么**。QA 与表现层只读这个文件即可还原结果，不需要猜 `decision.json` 是否被采纳。
 
+> 统计边界：`applied.json` 是 latest-wins 的“最后回执”，不是完整事件日志；迟到丢弃、被覆盖的旧回执只在日志里。按 `source`/`provider_id` 做统计时 **必须** 注明“只覆盖有回执的抽取”，精确统计需要可靠回执通道。
+
 ### 5.2 结构
 
 ```json
@@ -548,8 +573,21 @@ else:                                   -> applied_by = "provider"   # 预置/�
 ```
 
 - 表现层只有在 `applied_by == "fallback"` 时加 `[兜底]` 前缀；`provider` 是“配置好的主路径”，不是失败。
-- 任何 `applied_by` 都必须与 `fallback` / `source` 一致；不一致视为 mod 实现 bug，QA 应报失败。
-- `actual_item_id != choice.item_id`（item 选择时）说明决策没有真正生效（例如 `PRE_GET_COLLECTIBLE` 返回了 nil、底座生成了原版道具），`applied_by` **必须** 降级为 `fallback`，`reason_code` 记 `invalid_choice` 或 `not_applied`（日志保留细节）。
+- `applied_by` **由生产端按上述算法推导**，消费端只校验、不自行重新分类；任何 `applied_by` 都必须与 `fallback` / `source` 一致；不一致视为 mod 实现 bug，QA 应报失败。
+- `actual_item_id != choice.item_id`（item 选择时）说明决策没有真正生效。若随后由本地规则/Morph 替换成功，`applied_by` **必须** 降级为 `fallback`；若没有任何替换生效（原版道具留下），按 §5.4 写 `phase:"rejected"`、`applied_by:"none"`。
+
+### 5.4 应用结果与回执的完整规则
+
+生成后 **必须** 按下表写唯一一份 `applied.json`，不允许出现“字段不知道该填什么”的空档：
+
+| 实际结果 | `phase` | `applied_by` | `source` | `provider_id` | `decision_id` | `choice` | `fallback` | 说明 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 实际 id == 决策 id | `applied` | `llm` 或 `provider` | 随决策 | 随决策 | 该决策 | 实际 choice | 随决策 | 正常 |
+| 决策被拒/过期，本地规则或 Morph 生效 | `applied` | `fallback` | `rule` | `rule:local`/`rule:fallback` | 最后被拒决策或 `null` | 实际生效 choice | `true` | 兜底成功 |
+| 决策与实际不符，且 **没有** 任何替换生效（原版道具留下） | `rejected` | `none` | `null` | `null` | 最后被拒决策或 `null` | `null` | `true` | `error_code` 取失败原因；`reason_code` 用 `not_applied` / `no_fresh_decision` |
+| 无候选/角色已死，安全跳过（无实际道具变化） | `applied` | `fallback` | `rule` | `rule:guard` | `null` | `{"type":"action","action":"skip"}` | `true` | `error_code:null`，`reason_code:no_candidate`/`player_dead` |
+
+> 关键：`rejected` 不是“兜底成功”，它表示 **没有任何替换生效**；此时 `applied_by` 必须是 `none`，不能写 `fallback`。
 
 ---
 
@@ -565,6 +603,14 @@ else:                                   -> applied_by = "provider"   # 预置/�
 | llm 超时 | `validity_ms - 400ms` | 插件内部给模型的上限，保证还来得及降级到规则 |
 
 `validity_ms` **由 mod 按上下文选择**：近场/反应式用 1500ms；Boss 奖励等“长预取”用 5000–10000ms（上限 10000），刷新间隔随之取一半。不要把 Boss 战的整段时间压进 1500ms，否则决策在生成前就过期。
+
+插件预算 **必须** 从 `state.ts` 起算，而不是从“插件收到文件”起算：
+
+```
+remaining = state.ts + validity_ms - now - write_margin
+```
+
+这样文件轮询、排队和传输延迟都被计入。若 `remaining <= 0`，插件 **不得** 调用 llm，只允许发布拒绝/规则兜底。
 
 **mod 永不阻塞等待**：没有 sleep、没有 busy-wait、没有“等 1500ms 再继续”。1500ms 只用于判定“这份决策是否还新鲜”。
 
@@ -621,11 +667,13 @@ else:
 | 桥不可用（Profile B） | mod 启动探针 | 纯本地规则 + 气泡提示 | `IO` | `bridge_unavailable` | `fallback` |
 | 未预期异常 | 任意 | 捕获、记 `INTERNAL`、本地规则 | `INTERNAL` | `internal_error` | `fallback` |
 
+> **Morph 模式例外**：只有显式启用 `apply:morph` 时，mod 才可以在生成后用 Morph 替换底座。此时“消费点”是 **Morph 成功或玩家拿起**，不是池抽取；在底座存续期内到达且未过期的决策仍可用，`late` 从玩家拿起/底座销毁后算。默认预取模式不启用这个例外。
+
 ### 6.4 state 降级的处理
 
 - `state.error_code != null` 表示 mod 自己知道局面不完整（例如某个读取失败）。此时插件 **必须**：
   1. 不调用 llm（避免基于坏数据做昂贵决策）；
-  2. 若 body 仍满足规则所需字段，跑本地规则并发布 `fallback:true`、`error_code` 沿用 state 的值；
+  2. 若 body 仍满足规则所需字段，跑本地规则并发布 `fallback:true`、`error_code` / `reason_code` 沿用 state 的值；
   3. 若 body 不足以跑规则，发布 `valid:false` + `reason_code: "state_invalid"`。
 - mod 收到后按普通兜底处理；表现层显示 `[兜底]` 与降级原因（`reason_code`）。
 
@@ -635,10 +683,10 @@ else:
 
 1. `player.is_dead == true` → `{"type":"action","action":"skip"}`，`reason_code: "player_dead"`，`confidence: 1.0`。
 2. `candidates` 为空 → `{"type":"action","action":"skip"}`，`reason_code: "no_candidate"`，`confidence: 1.0`。
-3. `player.red_hearts == 0` 且存在 `tags` 含 `heal` 的候选 → 取 **pedestal_index 最小** 的 heal 候选。
+3. `player.red_hearts == 0` 且（`player.max_red_hearts` 缺省，或 `player.max_red_hearts > 0`）且存在 `tags` 含 `heal` 的候选 → 取 **pedestal_index 最小** 的 heal 候选；`max_red_hearts == 0` 的角色（Keeper/Blue Baby 等）跳过本规则。
 4. 已持有道具中没有任何 `tags` 含 `damage`，且存在 `tags` 含 `damage` 的候选 → 取 pedestal_index 最小的 damage 候选。
-5. 否则 → 取 pedestal_index 最小的候选（默认分支）。
-6. 平票时一律按 `pedestal_index` 升序，保证确定性；规则输出的 `confidence` 固定 `1.0`，`reason` 用简体中文短句。
+5. 否则 → 取 pedestal_index 最小的候选（默认分支）；池级预取的候选全为 `null` 时，按 `candidates` **数组下标升序**，再按 `item_id` 升序。
+6. 平票时一律按“非空 `pedestal_index` 升序 → 数组下标 → `item_id`”排序，保证两端确定性；规则输出的 `confidence` 固定 `1.0`，`reason` 用简体中文短句。
 
 > 规则只做“安全且可解释”的选择，不假装懂道具强度。更强的选择交给 llm/观众；规则只负责“绝不卡住、绝不越界”。
 
@@ -647,6 +695,33 @@ else:
 - 任何兜底 **必须** 同时具备：`applied.json`（Profile A/C）、`error_code`（安全跳过为 `null`）+ `reason_code`、可读 `reason`、屏幕提示（`[兜底]`）。
 - 不允许“默认拿第一个候选”但不记录；不允许 reason 为空且无 reason_code。
 - 日志 **必须** 含 `level`（debug/info/warn/error）、`module`、`request_id` / `decision_id`、`error_code` / `reason_code`；同类错误限频；**不得** 输出密钥。
+
+### 6.7 刷新、缓存与消费契约（R1 → R2）
+
+同一次生成会发出多个刷新请求（同一 `gen_level_key`、不同 `request_id`）。为避免“旧结果串到新请求 / 同一决策被用两次”，两端 **必须** 遵守：
+
+1. **身份**：每次写 state 生成新 `request_id`；`gen_level_key` 在同一生成目标内不变。mod 维护 `outstanding` 表（`request_id → sent_at`），请求在 `sent_at + validity_ms` 后过期，生成发生后立即清空该 K 的未决项。
+2. **插件去重与指纹**：可按 `gen_level_key` 合并同一生成目标的在途 llm 调用；缓存键 **必须** 包含“局面指纹”。指纹字段固定为：`gen_level_key`；`player.red_hearts` / `soul_hearts` / `max_red_hearts` / `character_id` / `is_dead`；`items[].id` + `count`（按 id 升序）；`candidates[].item_id`（按数组顺序）。任意一项变化 → 指纹变化 → **不得** 复用旧结果，必须按新请求重算。
+3. **结果归属**：为 R1 算出的结果可以在 R2 到达后发布，但只能绑定到 **发布时最新的请求**（R2），并使用 **新的 `decision_id`**；若指纹已变，丢弃旧结果，按 R2 重算。`decision_id` 永远不得复用；不要求“R1 的结果只能叫 R1”。
+4. **接收**：mod 接受任何 `request_id ∈ outstanding`、未过期、`gen_level_key` 匹配的决策；同一 K 多条时取 **接收时间最新** 的一条；旧决策被覆盖。生成已结束后到达的按 `late` 丢弃。
+5. **消费**：一次生成 **恰好消费一个** choice；消费后该 K 的其余决策全部作废，**不得** 留给下一次生成复用。`applied.json` 只记录被消费/最终兜底的那一次。
+6. **重复投递**：相同 `decision_id` 重复到达 → 忽略；相同 `request_id`、不同 `decision_id` → 允许，按接收时间取最新。
+7. **两段式临时决策**：插件可先发规则临时决策，合法组合是 `valid:true, source:"rule", fallback:true, error_code:"TIMEOUT", reason_code:"timeout"`（表示“模型尚未就绪”）；后续 llm 决策在生成前到达可覆盖它，生成后到达则丢弃。
+8. **缓存边界**：插件缓存必须有界（按 K 保留少量条目 + TTL = `validity_ms` + 宽限 5000ms），K 变化 / 生成完成 / 对端离线时清理。
+
+**R1 → R2 → 生成 → 迟到** 的规范时序（两端状态机必须能跑出同一结果）：
+
+| 时刻 | 事件 | 必须的结果 |
+| --- | --- | --- |
+| 0 | mod 发 R1（K，指纹 F1） | 插件开始一次 llm 调用 |
+| 700 | mod 刷新 R2（同 K，指纹仍 F1） | 插件不重复调用；记录“最新请求 = R2” |
+| 900 | llm 返回 | 指纹仍 F1 → 发布为 **R2** 的决策，`decision_id=D2`；**不存在 D1** |
+| 1000 | mod 收到 D2 | 缓存；R2 未过期，D2 可用 |
+| 1200 | mod 刷新 R3 | 最新请求 = R3；D2 仍可按“R2 未过期 + K 匹配”被接受 |
+| 5000 | 生成发生 | 消费 D2；`applied.json` 记 D2；清空 K 的未决项 |
+| 5200 | 为 R3 算出的结果到达 | 生成已结束 → `late` 丢弃，不改 applied |
+
+> 如果 700ms 时指纹变成 F2（例如玩家掉了红心），插件 **必须** 丢弃 R1 的在途结果，不能“反正候选没变就复用”；R2 重新算。生成前没有可用决策就按 §6.2 本地兜底。
 
 ---
 
@@ -668,18 +743,22 @@ else:
 
 ### 7.3 major 规则
 
-- **插件读到 major 高于自己支持的 state**：**不得** 猜测解析、**不得** 写 decision；记 `VALIDATION` / `version_major`，等待 mod 走超时兜底。若插件维护旧版 reader，可以按“对端 major”降级读写（读 v1、按 v1 写），否则拒绝。
-- **mod 读到 major 不匹配的 decision**：直接丢弃，本地规则兜底，`reason_code: "version_major"`；**不得** 尝试“尽量解析”。
-- **对端 major 更低**：若实现保留兼容 reader，则降级读+降级写；否则同样拒绝并兜底。兼容层至少保留一个发布周期，并有契约测试（§7.5）。
-- 跨 major 不做“拒绝信封”互写：无法确认对方 schema 时，写任何东西都可能被误读；沉默 + 超时兜底是唯一安全的失败方式（失败仍显式落在 `applied.json`）。
+处理顺序 **先选 codec，再判断是否拒绝**（避免“允许兼容 reader”与“major 不同就拒绝”互相打架）：
+
+1. 按 `peer.major` 查本端 codec 注册表；有对应 codec（当前 major，或保留的 N-1 兼容 reader）→ 用该 codec 解码，进入 §7.4 的 minor 判断。
+2. 没有对应 codec → 拒绝解析：插件 **不得** 猜测 state、**不得** 写 decision；mod **不得** 尝试解析 decision，直接本地兜底，`reason_code: "version_major"`。
+3. 兼容 reader 降级时 **必须保留**：`request_id`、`decision_id`、`gen_level_key`、`error_code`、`reason_code`、`valid`、`source`、`fallback`、`choice`；新 major 的专有可选字段可以丢弃并记日志，但不得改变上述字段语义。
+4. 跨 major 的“拒绝信封”是 **可选** 的：无法确认对方 schema 时，沉默 + 超时兜底是安全路径；若实现选择写拒绝信封，只允许使用双方冻结的最小字段集，且失败仍要落到日志/applied。
+5. 对端 major 更低时，若兼容 reader 存在则降级读+降级写；否则同样拒绝并兜底。兼容层至少保留一个发布周期，并有契约测试（§7.5）。
 
 ### 7.4 “对端比我新”的识别
 
 比较顺序：
 
-1. `peer.major != mine.major` → 不兼容，拒绝解析。
+1. 先按 `peer.major` 选 codec（§7.3）；没有对应 codec → 不兼容，拒绝解析并兜底。
 2. `peer.minor > mine.minor` → 视为“对端更新”：忽略未知字段；若 `peer.requires` 含本端未知能力 → 拒绝（`version_minor_feature`）；否则可以正常处理，并记一条 INFO“peer newer minor”。
 3. `peer.minor < mine.minor` → 视为“对端更旧”：按旧字段读，缺失的可选字段用默认值；缺必需字段 → `missing_field` 拒绝。
+4. `peer.minor == mine.minor` → 正常处理；仍按 `requires` 校验。
 
 ### 7.5 契约测试矩阵（三端共用）
 
@@ -763,16 +842,30 @@ DECISION_READY
 三份可直接用于契约测试的完整快照（含时间线、四个文件内容、日志）：
 
 - [01-success.json](../protocol/examples/01-success.json)：Boss 战前预取 llm 决策，生成时命中，`applied_by: "llm"`。
-- [02-fallback-invalid-id.json](../protocol/examples/02-fallback-invalid-id.json)：插件给了候选池外的 id，拒绝后本地规则 Morph 兜底。
+- [02-fallback-invalid-id.json](../protocol/examples/02-fallback-invalid-id.json)：插件给了候选池外的 id，拒绝后本地规则在生成当帧兜底。
 - [03-timeout-late.json](../protocol/examples/03-timeout-late.json)：生成时无决策，本地规则兜底；迟到决策被丢弃。
 
 > 每个示例是自包含快照：`files` 下是线上文档原文（`state.json` / `decision.json` / `event.json` / `applied.json`），`timeline` 是毫秒级时序，`logs` 是预期日志。QA 可直接取 `files.*` 做契约测试。示例里的 `ts` 是固定值，便于逐字节比对；运行时用当前时间。
 
 ---
 
-## 11. 变更记录
+## 11. 已知取舍（v1 明确不做/不保证）
+
+1. **单生成目标 + latest-wins，没有决策队列。** 同一时刻只有一个活跃请求；多底座房、快速 reroll、房间加载时抽取只能串行或吃 `nil`/本地规则。要“每个底座都由 agent 决定”，需要池级预取/队列，属于 v2，不在 v1 承诺。
+2. **`applied.json` / `event.json` 是 latest-wins 回执，不是完整审计日志。** 迟到、被覆盖、被拒绝的历史主要在日志里；精确统计需要可靠回执通道。
+3. **EventSource 是通知适配器，不是可靠事件总线。** 文件模式丢事件后不能补齐；`custom` 只做通知/展示，不能驱动新玩法；新增正式事件仍需 mod 改动 + minor。
+4. **Profile B 不能实时跑 agent。** 只能预置策略或本地规则；不要把它当“降级后还能问模型”。
+5. **跨 major 不强制写拒绝信封。** 没有可读 codec 时插件沉默、mod 超时兜底；`version_major` 只在日志里，`applied.json` 显示为 `TIMEOUT`。
+6. **v1 不导出地图/敌人数据。** `MapEnricher` / `EnemyEnricher` 只有在 mod 通过可选 `state` 字段导出对应数据后才成立；否则它们只是“看着能插”的占位，接入前需要 minor 扩展 state。
+7. **角色与血量上限是可选字段。** 缺省时规则按“未知”处理，可能降低选择质量；不阻塞主流程。
+8. **`source` 固定两值（llm/rule），来源细分放 `provider_id`。** 这是 captain 批准的取舍；代价是读文档的人可能把 `rule` 误当兜底，已用 §0.1 与 §3.5 的误用警告约束。
+
+---
+
+## 12. 变更记录
 
 | 版本 | 日期 | 变更 |
 | --- | --- | --- |
 | 1.0-draft.1 | 2026-11-07 | 首版：四文档、三种 Profile、`gen_level_key`/`decision_id`/`valid`/`reason_code`、决策有效期而非阻塞等待、五类错误码与兜底矩阵 |
 | 1.0-draft.2 | 2026-11-07 | 吸收 t2 参考实现发现：明确回调 62 的生成时序、`source` 固定 `llm`/`rule`、`valid=false` + `reason_code`、允许部分响应、每次抽取恰好一个分类；`viewer`/`preset` 用 `provider_id` 表达 |
+| 1.0-draft.3 | 2026-11-07 | 吸收 t7 评审：`state.reason_code`、角色/血量上限可选字段、validity 双阶段判定、刷新/缓存/消费契约、`reroll` 禁止在回调 62 使用、provider_id 前缀交叉校验、未知 reason_code 容忍、跨 major codec-first、应用结果回执真值表、已知取舍清单 |

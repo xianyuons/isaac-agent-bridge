@@ -1,5 +1,6 @@
-# 架构：分层、接口与扩展点（v1.0）
+# 架构：分层、接口与扩展点（v1.0-draft.3）
 
+> 版本：v1.0-draft.3（2026-11-07，t7 评审回写）。协议细节见 [protocol.md](protocol.md) §12 变更记录。
 > 配套：[协议](protocol.md)、[代码规范](standards.md)。
 > 目标：把“游戏侧读局面 / 插件侧做决策 / 表现层展示”拆成四层，层与层之间只通过本文列出的接口通信；以后加新玩法（离线小模型、观众投票、地图增强、OBS 叠加）只加实现，不改核心。
 
@@ -139,8 +140,11 @@ interface Trigger {
 }
 
 interface GameState {
-  player: { redHearts: number; soulHearts: number; isDead?: boolean };
-  items: ReadonlyArray<{ id: number; name: string | null; tags?: string[] }>;
+  player: {
+    redHearts: number; soulHearts: number;
+    maxRedHearts?: number; characterId?: number; isDead?: boolean;
+  };
+  items: ReadonlyArray<{ id: number; name: string | null; tags?: string[]; count?: number }>;
   room: { type: string; isBossRoom: boolean; gridIndex?: number | null; isClear?: boolean };
   floor: number;
   boss: { id: number; name: string | null; hp?: number; maxHp?: number } | null;
@@ -158,6 +162,7 @@ interface StateDoc {
   ts: number;
   validityMs: number;
   errorCode: ErrorCode | null;
+  reasonCode: string | null;
   features: string[];
   requires: string[];
   capabilities: string[];
@@ -207,6 +212,8 @@ interface AppliedDoc {
 
 interface VoteTally { itemId: number; votes: number; }
 ```
+
+> 两维拆分：`source` 是 **可靠性维度**（模型产生 / 非模型产生，永久二值）；`providerId` 是 **来源维度**（`llm:primary`、`viewer:bilibili`、`preset:scripted`…）。**禁止** 用 `provider_id` 判断是否兜底；兜底只由 `role`/`fallback`/`applied_by` 决定。校验器必须检查前缀与 `source` 一致（`llm:*` ⇔ `llm`；`rule:*`/`viewer:*`/`preset:*` ⇔ `rule`）。
 
 #### BridgePort（传输层唯一入口）
 
@@ -258,6 +265,7 @@ interface DecisionDraft {
 interface DecisionProvider {
   readonly id: string;
   readonly source: Source;             // "llm" | "rule"
+  readonly role: "primary" | "fallback"; // 主路径还是尾部兜底；决定 fallback 字段
   readonly priority: number;           // 越小越先
   canHandle(ctx: ProviderContext): boolean;
   decide(ctx: ProviderContext): Promise<DecisionDraft>;
@@ -267,6 +275,7 @@ interface DecisionProvider {
 - Provider **不得** 写文件、读游戏、改 `state`；只返回 draft。
 - 必须响应 `AbortSignal`；超时由 Orchestrator 控制，Provider 不自己 sleep。
 - `canHandle` 必须廉价、同步、无副作用。
+- `role` 由组装配置决定：`primary` 产出 `fallback:false`；`fallback` 产出 `fallback:true`。禁止同一 Provider 在不同请求里悄悄改角色（除非配置变更）。
 
 #### DecisionOrchestrator
 
@@ -333,6 +342,8 @@ interface StateEnricher<T = unknown> {
 - 并行执行；每个 Enricher 独立超时；失败只记日志并丢弃该 namespace，**不得** 让决策失败。
 - 输出必须可 JSON 序列化且 ≤16 KiB；只读 `state`，不修改。
 - 同名 namespace 冲突 → 后者跳过并告警。
+- **输入边界（重要）**：Enricher 只能看到 `state` / `trigger` / 外部静态数据；它 **不能** 自己读游戏内存。`MapEnricher` 的地图、`EnemyEnricher` 的敌人构成在 v1 的 `GameState` 里没有对应字段，必须先由 mod 通过可选 `state` 字段导出（minor），否则它们只是“看着能插”的占位。`NextFloorPreviewEnricher` 只依赖 `floor` + `items`，v1 就能成立。
+- 接入新 Enricher 时必须在 `requires` 里声明依赖的 state 字段；缺字段时 Enricher **不得** 假装有数据。
 
 #### Presenter
 
@@ -420,6 +431,7 @@ Lua 没有 interface，统一用“字段 + 函数签名”的 table 描述；�
 class AgentDecisionProvider implements DecisionProvider {
   readonly id = "llm:primary";
   readonly source = "llm" as const;
+  readonly role = "primary" as const;
   readonly priority = 10;
   constructor(private readonly agent: AgentClient, private readonly prompt: PromptBuilder) {}
   canHandle(ctx: ProviderContext) {
@@ -439,6 +451,7 @@ class AgentDecisionProvider implements DecisionProvider {
 class LocalRuleProvider implements DecisionProvider {
   readonly id = "rule:fallback";
   readonly source = "rule" as const;
+  readonly role = "fallback" as const;
   readonly priority = 1000;
   canHandle() { return true; }
   async decide(ctx: ProviderContext) {
@@ -450,6 +463,7 @@ class LocalRuleProvider implements DecisionProvider {
 class ViewerVoteProvider implements DecisionProvider {
   readonly id = "viewer:bilibili";
   readonly source = "rule" as const;
+  readonly role = "primary" as const;
   readonly priority = 20;
   canHandle(ctx: ProviderContext) { return ctx.votes.length >= 1 && ctx.request.state.candidates.length > 0; }
   async decide(ctx: ProviderContext) {
@@ -464,6 +478,7 @@ class ViewerVoteProvider implements DecisionProvider {
 class PresetProvider implements DecisionProvider {
   readonly id = "preset:scripted";
   readonly source = "rule" as const;
+  readonly role = "primary" as const;
   readonly priority = 30;
   constructor(private readonly presets: PresetStore) {}
   canHandle(ctx: ProviderContext) { return this.presets.has(ctx.request.genLevelKey, ctx.request.state); }
@@ -482,7 +497,7 @@ class PresetProvider implements DecisionProvider {
 
 `priority` 只在同一模式内排序；观众模式和 llm 不并行抢答，否则“两个都算主路径”。尾部规则 Provider 的 `fallback=true`，主路径 Provider 的 `fallback=false`。
 
-**两段式（可选优化）**：同一 `gen_level_key` 的刷新请求到来时，先用规则立即回一份 `fallback=true` 的临时决策；llm 结果返回后缓存，下一次刷新再发 `fallback=false` 的 llm 决策。生成前最后一次刷新拿到什么就用什么，避免玩家手快时一直吃规则，也避免把“规则占位”伪装成主路径。
+**两段式（可选优化）**：同一 `gen_level_key` 的刷新请求到来时，先用规则立即回一份 `fallback=true` 的临时决策；**合法组合必须是** `valid:true`、`source:"rule"`、`fallback:true`、`error_code:"TIMEOUT"`、`reason_code:"timeout"`（表示“模型尚未就绪”，满足 protocol §3.3）。llm 结果返回后缓存，下一次刷新再发 `fallback=false` 的 llm 决策。生成前最后一次刷新拿到什么就用什么，避免玩家手快时一直吃规则，也避免把“规则占位”伪装成主路径。
 
 ### 4.2 EventSource
 
@@ -538,14 +553,16 @@ function GameHookSource:stop() self.sink = nil end
 
 > 具体回调名以 REPENTOGON 文档为准（`MC_POST_NEW_ROOM`、`MC_POST_PICKUP_INIT`、`MC_PRE_GET_COLLECTIBLE` 等）；架构只约束“回调内不做 I/O”。
 
+**边界**：EventSource 是 **通知适配器**，不是可靠事件总线。文件模式 `event.json` 是 latest-wins（protocol §4.1），丢事件不能补齐；`custom` 只做通知/展示，不能驱动新玩法；新增正式事件仍要改 mod + 协议 minor。真正可靠的事件流要走 pipe/HTTP 队列，不属于 v1 默认路径。
+
 ### 4.3 StateEnricher
 
 | 实现 | namespace | 用途 |
 | --- | --- | --- |
-| `MapEnricher` | `map` | 当前层网格、已探索房间、门/商店/宝箱房位置 |
-| `EnemyEnricher` | `enemies` | Boss/精英血量、房间敌人构成、威胁评分 |
-| `ItemPoolEnricher` | `item_pool` | 道具池权重/已移除道具，帮助判断“值不值得拿” |
-| `NextFloorPreviewEnricher` | `next_floor_preview` | **未来**：预测下一层可能出现的道具（只读增强，不改协议） |
+| `MapEnricher` | `map` | 当前层网格、已探索房间、门/商店/宝箱房位置（**需 mod 先导出 `state.map`**，v1 未提供） |
+| `EnemyEnricher` | `enemies` | Boss/精英血量、房间敌人构成、威胁评分（**需 mod 先导出 `state.enemies`**，v1 未提供） |
+| `ItemPoolEnricher` | `item_pool` | 道具池权重/已移除道具（静态表，v1 可成立） |
+| `NextFloorPreviewEnricher` | `next_floor_preview` | **未来**：预测下一层可能出现的道具（只依赖 floor/items，v1 可成立） |
 
 最小实现（未来那个）：
 
@@ -594,6 +611,7 @@ function BubblePresenter:close() self.text = nil end
 
 - Presenter **不得** 改 `choice`、不得重试决策、不得在失败时抛到决策层。
 - `BubblePresenter` 的 `view` 来自 `applied.json`（真实结果），而不是 `decision.json`（候选意图）；这样“说了拿 A、实际拿了 B”不会骗玩家。
+- **可插拔边界**：气泡固定在 mod 侧（必须画进游戏），插件侧换不了；`voice` / `danmaku` / `overlay` 才是插件侧可自由替换的通道。把气泡也当成“换个 Presenter 就行”是假扩展点。
 
 ---
 
@@ -612,6 +630,7 @@ function BubblePresenter:close() self.text = nil end
 - 传输层负责：读取、大小限制、路径校验、解码、去重；不负责业务判断。
 - 决策必须幂等：同一 `decision_id` 重放不得产生第二次生成；接收方按 `request_id` + `gen_level_key` 去重。
 - 事件不承诺 exactly-once；需要可靠事件时用 pipe/HTTP 队列，file 模式只用 `state` 兜底事实。
+- **统计边界**：`applied.json`/`event.json` 是 latest-wins 回执，不是完整审计日志；按 `source`/`provider_id` 统计只能覆盖有回执的抽取，精确统计要可靠回执通道。
 
 ---
 
@@ -631,10 +650,10 @@ interface ProtocolCodec {
 }
 ```
 
-- 编解码器注册表：按 `peer.major` 选 codec；没有匹配 → 返回 `null`，**不猜**。
+- 编解码器注册表：**先按 `peer.major` 选 codec**；有兼容 reader 就按对端 major 解码，没有才拒绝，**不猜**。
 - minor 更新：同一 codec 忽略未知字段；`requires` 里出现未知能力 → 拒绝（`version_minor_feature`）。
-- major 更新：拒绝解析；插件不写 decision，mod 超时后本地兜底；日志记 `version_major`。
-- “对端比我新”识别：先比 major 再比 minor；`peer.minor > mine.minor` 记 INFO 并按“忽略未知”处理；`peer.major > mine.major` 记 WARN 并走兜底。
+- major 更新：没有对应 codec 才拒绝；插件不写 decision，mod 超时后本地兜底；日志记 `version_major`。兼容 reader 必须保留 `request_id`/`decision_id`/`gen_level_key`/`error_code`/`reason_code`/`valid`/`source`/`fallback`/`choice`，只丢弃新 major 专有可选字段。
+- “对端比我新”识别：先选 codec，再比 minor；`peer.minor > mine.minor` 记 INFO 并按“忽略未知”处理；没有 codec 才记 WARN 并走兜底。
 - 保留 N-1 兼容 reader 至少一个发布周期；契约测试用 `protocol/examples` 固定快照（V-01…V-20）。
 - **不得** 用“版本号字符串前缀”或“字段是否存在”反推能力；能力只认 `features` / `requires`。
 
@@ -692,6 +711,8 @@ sequenceDiagram
 | `nil` + Morph（反应式） | 返回 `nil`，生成后再替换 | 决策可以在生成后到达 | 可见闪烁、可能双重判定；仅显式开启 |
 
 两种实现都必须：回调内零 I/O、零等待；没命中返回 `nil`；事后用 `POST_PICKUP_INIT` 核验实际生成 id。
+
+> 刷新、缓存、结果归属与消费的完整契约见 protocol §6.7；本节只画主路径，不重复定义“R1 的结果能不能绑到 R2”——以 §6.7 为准。
 
 ---
 

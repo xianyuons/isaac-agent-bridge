@@ -4,19 +4,19 @@
   "assumptions": {
     "profile": "A",
     "mode": "prefetch（预取）",
-    "validity_ms": 5000,
-    "refresh_interval_ms": 2500,
+    "validity_ms": 6000,
+    "refresh_interval_ms": 3000,
     "generation_at_ms": 5000,
     "clock": "所有 ts 为固定 epoch ms（2026-11-07T00:30:00+08:00 起算），便于逐字节比对"
   },
   "timeline": [
     { "t_ms": -20, "actor": "mod", "action": "写 event.json（boss_approach, seq=42）；进入 Boss 房，预取奖励池决策" },
-    { "t_ms": 0, "actor": "mod", "action": "写 state.json（request_id=r-7f3a-000042, gen_level_key=f2:r84:boss:p0:9c1e, validity_ms=5000）" },
+    { "t_ms": 0, "actor": "mod", "action": "写 state.json（request_id=r-7f3a-000042, gen_level_key=f2:r84:boss:p0:9c1e, validity_ms=6000）" },
     { "t_ms": 35, "actor": "plugin", "action": "轮询读到 state，校验通过，StateEnricher 完成" },
-    { "t_ms": 40, "actor": "plugin", "action": "AgentDecisionProvider 开始；预算 = 5000 - 400 = 4600ms" },
+    { "t_ms": 40, "actor": "plugin", "action": "AgentDecisionProvider 开始；预算按 state.ts 起算" },
     { "t_ms": 861, "actor": "agent", "action": "返回 draft：item_id=22, confidence=0.72" },
     { "t_ms": 900, "actor": "plugin", "action": "校验通过，原子写 decision.json（valid=true, fallback=false）" },
-    { "t_ms": 940, "actor": "mod", "action": "读到 decision，缓存（未过期：900 <= 5000）" },
+    { "t_ms": 940, "actor": "mod", "action": "读到 decision，缓存（未过期：900 <= 6000）" },
     { "t_ms": 5000, "actor": "mod", "action": "Boss 死亡，奖励底座开始池抽取；MC_PRE_GET_COLLECTIBLE(62) 当帧查内存，返回 22" },
     { "t_ms": 5002, "actor": "mod", "action": "POST_PICKUP_INIT 核验实际生成 id=22；写 applied.json（applied_by=llm）" },
     { "t_ms": 5020, "actor": "mod", "action": "BubblePresenter 弹出 reason（无 [兜底] 前缀）" }
@@ -35,8 +35,9 @@
       "request_id": "r-7f3a-000042",
       "gen_level_key": "f2:r84:boss:p0:9c1e",
       "ts": 1793982600000,
-      "validity_ms": 5000,
+      "validity_ms": 6000,
       "error_code": null,
+      "reason_code": null,
       "features": ["transport:file_write", "hook:pre_get_collectible", "apply:prefetch", "action:reroll"],
       "requires": [],
       "capabilities": ["transport:file_write", "transport:file_read", "hook:pre_get_collectible", "apply:prefetch", "action:reroll"],
@@ -47,7 +48,7 @@
         "payload": { "boss_id": 63, "pool": "boss" }
       },
       "state": {
-        "player": { "red_hearts": 4, "soul_hearts": 0, "is_dead": false },
+        "player": { "red_hearts": 4, "soul_hearts": 0, "max_red_hearts": 6, "character_id": 0, "is_dead": false },
         "items": [
           { "id": 1, "name": "Sad Onion", "tags": ["tear"], "count": 1 },
           { "id": 118, "name": "Brimstone", "tags": ["damage"], "count": 1 }
@@ -104,7 +105,7 @@
     }
   },
   "logs": [
-    "INFO mod/bridge request=r-7f3a-000042 gen=f2:r84:boss:p0:9c1e validity=5000ms trigger=boss_approach",
+    "INFO mod/bridge request=r-7f3a-000042 gen=f2:r84:boss:p0:9c1e validity=6000ms trigger=boss_approach",
     "INFO plugin/orchestrator request=r-7f3a-000042 provider=llm:primary elapsed=861ms",
     "INFO plugin/bridge wrote decision.json decision=d-9c1e-000001 valid=true fallback=false",
     "INFO mod/generation request=r-7f3a-000042 decision=d-9c1e-000001 actual=22 applied_by=llm latency=900ms"
