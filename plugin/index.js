@@ -124,6 +124,19 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/**
+ * 硬截止：到点立即 reject，不等待底层 promise 是否响应 AbortSignal。
+ * 底层 promise 之后返回/拒绝由 Promise.race 的处理器吸收，不会再落盘或抛出。
+ */
+function withDeadline(promise, deadlineAt, message) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    const ms = Math.max(1, deadlineAt - Date.now())
+    timer = setTimeout(() => reject(new IsaacError('TIMEOUT', 'timeout', message)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
 function byteLength(text) {
   return Buffer.byteLength(text, 'utf8')
 }
@@ -146,21 +159,20 @@ function stripControlChars(text) {
   return String(text).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
 }
 
-/** 单行化并按“字符数 + UTF-8 字节数”双重截断 reason；超长不拒绝，截断后发布。 */
+function reasonWithinLimits(value) {
+  return typeof value === 'string'
+    && Array.from(value).length <= MAX_REASON_CHARS
+    && byteLength(value) <= MAX_REASON_BYTES
+}
+
+/**
+ * 单行化 reason。**不截断**：protocol §1.6/§9 明确“超限即 VALIDATION/out_of_range，不得截断后继续”。
+ * 超限由调用方拒绝（模型输出）或改用固定的短兜底句（内部兜底）。
+ */
 function sanitizeReason(value) {
   if (typeof value !== 'string') return null
   const oneLine = stripControlChars(value).replace(/\s+/g, ' ').trim()
-  if (oneLine.length === 0) return null
-  const chars = Array.from(oneLine)
-  let out = ''
-  let count = 0
-  for (const char of chars) {
-    if (count >= MAX_REASON_CHARS) break
-    if (byteLength(out + char) > MAX_REASON_BYTES) break
-    out += char
-    count += 1
-  }
-  return out.length > 0 ? out : null
+  return oneLine.length > 0 ? oneLine : null
 }
 
 function shortText(value, max = 160) {
@@ -463,21 +475,52 @@ async function writePluginStatusAtomic(bridgeDir, doc) {
 const PUBLISH_TTL_MS = 10 * 60 * 1000
 const MAX_TRACKED_REQUESTS = 64
 
+function fingerprintOf(stateDoc) {
+  if (!isPlainObject(stateDoc) || !isPlainObject(stateDoc.state)) return null
+  const state = stateDoc.state
+  const player = isPlainObject(state.player) ? state.player : {}
+  const items = Array.isArray(state.items)
+    ? state.items
+      .map((item) => ({ id: item.id, count: item.count ?? 1 }))
+      .sort((a, b) => a.id - b.id)
+    : []
+  const candidates = Array.isArray(state.candidates)
+    ? state.candidates.map((candidate) => candidate.item_id)
+    : []
+  return JSON.stringify([
+    stateDoc.session_id ?? null,
+    stateDoc.gen_level_key ?? null,
+    player.red_hearts ?? null,
+    player.soul_hearts ?? null,
+    player.max_red_hearts ?? null,
+    player.character_id ?? null,
+    player.is_dead ?? false,
+    items,
+    candidates,
+  ])
+}
+
 const publishState = {
   latest: null,
   byKey: new Map(),
-  consumed: new Map(),
+  // §6.7 #6：相同 decision_id 忽略；相同 request_id、不同 decision_id 允许。
+  publishedDecisionIds: new Map(),
+  publishedByRequest: new Map(),
 }
 
 function resetPublishStateForTest() {
   publishState.latest = null
   publishState.byKey.clear()
-  publishState.consumed.clear()
+  publishState.publishedDecisionIds.clear()
+  publishState.publishedByRequest.clear()
 }
 
 function prunePublishState(now = Date.now()) {
-  for (const [requestId, at] of publishState.consumed) {
-    if (now - at > PUBLISH_TTL_MS) publishState.consumed.delete(requestId)
+  for (const map of [publishState.publishedDecisionIds, publishState.publishedByRequest]) {
+    for (const [key, value] of map) {
+      const at = typeof value === 'number' ? value : value?.ts
+      if (typeof at === 'number' && now - at > PUBLISH_TTL_MS) map.delete(key)
+    }
   }
   for (const [key, entry] of publishState.byKey) {
     if (entry !== publishState.latest && now - entry.startedAt > PUBLISH_TTL_MS) {
@@ -507,9 +550,11 @@ function registerRequest(state) {
   prunePublishState(now)
   const entry = {
     requestId: state.request_id,
+    sessionId: state.session_id,
     genLevelKey: state.gen_level_key,
     ts: state.ts,
     startedAt: now,
+    fingerprint: fingerprintOf(state),
   }
   const latest = publishState.latest
   if (!latest || state.ts >= latest.ts) publishState.latest = entry
@@ -528,11 +573,28 @@ function isPastValidity(state, now = Date.now()) {
   return now >= state.ts + validityMs
 }
 
+function entryFromStateDoc(doc) {
+  if (!isPlainObject(doc)) return null
+  if (!isNonEmptyString(doc.request_id) || !isNonEmptyString(doc.session_id) || !isNonEmptyString(doc.gen_level_key)) return null
+  if (!isInt(doc.ts, 0, Number.MAX_SAFE_INTEGER)) return null
+  return {
+    requestId: doc.request_id,
+    sessionId: doc.session_id,
+    genLevelKey: doc.gen_level_key,
+    ts: doc.ts,
+    fingerprint: fingerprintOf(doc),
+  }
+}
+
 /**
- * 写 decision 前判定：当前请求是否仍是最新、是否已被消费、是否已过有效期。
- * 返回 { ok:true } 或 { ok:false, discardReason, errorCode, reasonCode }。
+ * 写 decision 前判定（draft.5 §6.7）：
+ * - 相同 decision_id → 忽略；
+ * - 旧结果可发布，但必须绑定“发布时最新请求”并保留新的 decision_id；
+ * - 指纹变了 / 换层 / 新请求已有决策 → 丢弃；
+ * - 过期 → late。
+ * 返回 { ok:true, rebind? } 或 { ok:false, discardReason, errorCode, reasonCode }。
  */
-async function evaluatePublishGate({ bridgeDir, state, stateSource, requireFresh = false }) {
+async function evaluatePublishGate({ bridgeDir, state, stateSource, requireFresh = false, doc }) {
   prunePublishState()
 
   // 迟到结果（模型忽略 AbortSignal 时常见）一律不写盘；不能只依赖 AbortSignal 生效。
@@ -540,43 +602,54 @@ async function evaluatePublishGate({ bridgeDir, state, stateSource, requireFresh
     return staleGate('late', 'TIMEOUT', 'late')
   }
 
-  if (publishState.consumed.has(state.request_id)) {
-    return staleGate('already_consumed', 'VALIDATION', 'request_mismatch')
+  // 相同 decision_id 重复投递 → 忽略（§6.7 #6）。
+  if (doc && publishState.publishedDecisionIds.has(doc.decision_id)) {
+    return staleGate('duplicate_decision', null, null)
   }
 
-  const latest = publishState.latest
-  if (latest && (latest.requestId !== state.request_id || latest.genLevelKey !== state.gen_level_key)) {
-    const levelChanged = latest.genLevelKey !== state.gen_level_key
-    return staleGate(
-      levelChanged ? 'level_changed' : 'superseded',
-      'VALIDATION',
-      levelChanged ? 'level_mismatch' : 'request_mismatch',
-    )
-  }
-
-  const keyLatest = publishState.byKey.get(state.gen_level_key)
-  if (keyLatest && keyLatest.requestId !== state.request_id) {
-    return staleGate('superseded', 'VALIDATION', 'request_mismatch')
-  }
+  let target = publishState.latest
 
   // 文件模式下再读一次 state.json：mod 可能已经写了 R2，而插件还没登记 R2。
   if (stateSource !== 'inline') {
     try {
-      const { doc } = await readStateFile(bridgeDir)
-      if (isPlainObject(doc) && isNonEmptyString(doc.request_id)) {
-        const diskTs = isInt(doc.ts, 0, Number.MAX_SAFE_INTEGER) ? doc.ts : 0
-        const levelChanged = doc.gen_level_key !== state.gen_level_key
-        if (diskTs >= state.ts && (doc.request_id !== state.request_id || levelChanged)) {
-          return staleGate(
-            levelChanged ? 'level_changed' : 'superseded',
-            'VALIDATION',
-            levelChanged ? 'level_mismatch' : 'request_mismatch',
-          )
-        }
-      }
+      const { doc: disk } = await readStateFile(bridgeDir)
+      const diskEntry = entryFromStateDoc(disk)
+      if (diskEntry && diskEntry.ts >= state.ts) target = diskEntry
     } catch {
       // state.json 暂时缺失/不可读：以进程内登记为准（mod 可能正在原子替换）。
     }
+  }
+
+  const currentFingerprint = fingerprintOf(state)
+  const rebindOrDiscard = (candidate) => {
+    if (candidate.genLevelKey !== state.gen_level_key) {
+      return staleGate('level_changed', 'VALIDATION', 'level_mismatch')
+    }
+    // 新请求已经有决策：旧结果不再覆盖，避免用更慢的旧结果盖掉新结果。
+    if (publishState.publishedByRequest.has(candidate.requestId)) {
+      return staleGate('superseded', 'VALIDATION', 'request_mismatch')
+    }
+    // §6.7 #2/#3：指纹变了不得复用。
+    if (!candidate.fingerprint || !currentFingerprint || candidate.fingerprint !== currentFingerprint) {
+      return staleGate('fingerprint_changed', 'VALIDATION', 'request_mismatch')
+    }
+    return {
+      ok: true,
+      rebind: {
+        requestId: candidate.requestId,
+        sessionId: candidate.sessionId,
+        genLevelKey: candidate.genLevelKey,
+      },
+    }
+  }
+
+  if (target && (target.requestId !== state.request_id || target.genLevelKey !== state.gen_level_key)) {
+    return rebindOrDiscard(target)
+  }
+
+  const keyLatest = publishState.byKey.get(state.gen_level_key)
+  if (keyLatest && keyLatest.requestId !== state.request_id) {
+    return rebindOrDiscard(keyLatest)
   }
 
   return { ok: true }
@@ -603,7 +676,7 @@ function recordDiscard(ctx, state, gate) {
 function discardedResult(state, gate, meta) {
   return {
     ok: true,
-    text: `[丢弃/${gate.reasonCode}] request=${state.request_id} reason=${gate.discardReason}；不覆盖 decision.json`,
+    text: `[丢弃/${gate.reasonCode ?? gate.discardReason}] request=${state.request_id} reason=${gate.discardReason}；不覆盖 decision.json`,
     written: false,
     discarded: true,
     discard_reason: gate.discardReason,
@@ -624,15 +697,25 @@ function discardedResult(state, gate, meta) {
  */
 async function publishDecision({ bridgeDir, state, stateSource, doc, ctx, requireFresh = false }) {
   return withWriteLock(async () => {
-    const gate = await evaluatePublishGate({ bridgeDir, state, stateSource, requireFresh })
+    const gate = await evaluatePublishGate({ bridgeDir, state, stateSource, requireFresh, doc })
     if (!gate.ok) {
       recordDiscard(ctx, state, gate)
       return { written: false, discarded: true, ...gate }
     }
+    if (gate.rebind) {
+      // §6.7 #3：旧结果可以发布，但只能绑定发布时最新的请求；decision_id 保持本次新生成的值。
+      doc.session_id = gate.rebind.sessionId
+      doc.request_id = gate.rebind.requestId
+      doc.gen_level_key = gate.rebind.genLevelKey
+      assertDecisionLegal(doc, { session_id: doc.session_id, state: state.state })
+    }
     const written = await writeDecisionLocked(bridgeDir, doc)
-    // 一次生成恰好消费一个 choice；同一 request_id 不再发布第二份决策。
-    publishState.consumed.set(state.request_id, Date.now())
-    return { written: true, ...written }
+    publishState.publishedDecisionIds.set(doc.decision_id, Date.now())
+    publishState.publishedByRequest.set(doc.request_id, {
+      decisionId: doc.decision_id,
+      ts: Date.now(),
+    })
+    return { written: true, rebind: gate.rebind ?? null, ...written }
   })
 }
 
@@ -1184,6 +1267,9 @@ function normalizeDraft(payload, gameState) {
   }
 
   const reason = sanitizeReason(payload.reason)
+  if (reason !== null && !reasonWithinLimits(reason)) {
+    throw new DraftError('invalid_reason', 'reason 超过 280 字符或 1024 UTF-8 字节')
+  }
   return { choice, reason, confidence }
 }
 
@@ -1287,14 +1373,18 @@ async function requestModelDecision({ llm, selection, state, intent, viewer, dea
 
     let text
     try {
-      text = await callModelOnce({
-        llm,
-        selection,
-        prompt,
-        maxTokens: 512,
-        timeoutMs,
-        outerSignal: signal,
-      })
+      text = await withDeadline(
+        callModelOnce({
+          llm,
+          selection,
+          prompt,
+          maxTokens: 512,
+          timeoutMs,
+          outerSignal: signal,
+        }),
+        deadlineAt,
+        '模型调用超过硬截止（validity 窗口）',
+      )
     } catch (error) {
       lastReasonCode = error instanceof IsaacError ? error.reasonCode : 'model_error'
       lastMessage = error?.message ?? '模型调用失败'
@@ -1692,7 +1782,9 @@ async function runIsaacDecideInner({ config, ctx, args, exec }) {
     const errorCode = cause.errorCode ?? 'MODEL'
     const suffix = cause.note
       ?? (errorCode === 'TIMEOUT' ? '模型未及时返回，已按本地规则兜底' : '模型不可用，已按本地规则兜底')
-    const reason = sanitizeReason(`${rule.reason}；${suffix}`)
+    const composed = sanitizeReason(`${rule.reason}；${suffix}`)
+    // 内部兜底句固定、短；若异常超限（例如未来规则句变长），改用固定短句，不截断。
+    const reason = composed !== null && reasonWithinLimits(composed) ? composed : '本地规则兜底'
     try {
       const doc = makeDecisionDoc(
         state,

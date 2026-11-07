@@ -428,10 +428,11 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 {
-  // 同一个 request_id 只能发布一次；第二次必须丢弃。
+  // §6.7 #6：相同 request_id、不同 decision_id 允许，按接收时间取最新。
+  // “消费”发生在 mod 侧，插件不能把 publish 当成 consume。
   resetPublish()
   const state = freshState()
-  state.request_id = 'r-consume-0001'
+  state.request_id = 'r-same-request-01'
   const ctx = fakeLlmCtx([
     { text: '{"item_id":22,"reason":"第一份","confidence":0.9}' },
     { text: '{"item_id":4,"reason":"第二份","confidence":0.9}' },
@@ -443,10 +444,33 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
     config: { bridgeDir }, ctx, args: { state }, exec: fakeExec,
   })
   const written = JSON.parse(await fsp.readFile(path.join(bridgeDir, 'decision.json'), 'utf8'))
-  eq('consume first written', first.written, true)
-  eq('consume second discarded', second.discarded, true)
-  eq('consume second reason', second.discard_reason, 'already_consumed')
-  eq('consume file keeps first choice', written.decision.choice.item_id, 22)
+  eq('same request first written', first.written, true)
+  eq('same request second allowed', second.written, true)
+  eq('same request second not discarded', second.discarded, undefined)
+  eq('same request new decision id', second.decision_id !== first.decision_id, true)
+  eq('same request latest wins in file', written.decision.choice.item_id, 4)
+}
+
+{
+  // 相同 decision_id 重复投递 → 忽略（§6.7 #6）。
+  resetPublish()
+  const state = freshState()
+  state.request_id = 'r-duplicate-decision-01'
+  T.registerRequest(state)
+  const doc = T.makeDecisionDoc(
+    state,
+    { choice: { type: 'item', item_id: 22 }, reason: 'dup', confidence: 1 },
+    { source: 'llm', providerId: 'llm:primary', fallback: false },
+  )
+  const first = await T.publishDecision({
+    bridgeDir, state, stateSource: 'inline', doc, ctx: {},
+  })
+  const second = await T.publishDecision({
+    bridgeDir, state, stateSource: 'inline', doc, ctx: {},
+  })
+  eq('duplicate decision first written', first.written, true)
+  eq('duplicate decision ignored', second.discarded, true)
+  eq('duplicate decision reason', second.discardReason, 'duplicate_decision')
 }
 
 {
@@ -479,7 +503,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 {
-  // 磁盘上的 state.json 已经换成 R2，而插件还没登记 R2：R1 仍须丢弃。
+  // §6.7 #3：磁盘上的 state.json 已经换成 R2，插件还没登记 R2；
+  // R1 的结果可发布，但必须绑定 R2（最新请求）并使用新的 decision_id。
   resetPublish()
   const r1 = freshState()
   r1.request_id = 'r-disk-000001'
@@ -498,9 +523,61 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   const result = await T.runIsaacDecide({
     config: { bridgeDir }, ctx, args: {}, exec: fakeExec,
   })
-  eq('disk supersede discarded', result.discarded, true)
-  eq('disk supersede reason', result.discard_reason, 'superseded')
-  eq('disk supersede not written', result.written, false)
+  const written = JSON.parse(await fsp.readFile(path.join(bridgeDir, 'decision.json'), 'utf8'))
+  eq('disk rebind written', result.written, true)
+  eq('disk rebind result request', result.request_id, 'r-disk-000002')
+  eq('disk rebind decision request', written.request_id, 'r-disk-000002')
+  eq('disk rebind keeps choice', written.decision.choice.item_id, 22)
+}
+
+{
+  // §6.7 #3：R2 已登记但尚未产出决策时，R1 的结果绑定到 R2 发布。
+  resetPublish()
+  const r1 = freshState()
+  r1.request_id = 'r-rebind-000001'
+  r1.ts = Date.now()
+  const r2 = freshState()
+  r2.request_id = 'r-rebind-000002'
+  r2.ts = Date.now() + 10
+  const ctx = fakeLlmCtx([{
+    delayMs: 150,
+    text: '{"item_id":22,"reason":"绑定最新请求","confidence":0.9}',
+  }])
+  const run = T.runIsaacDecide({
+    config: { bridgeDir }, ctx, args: { state: r1 }, exec: fakeExec,
+  })
+  await sleep(20)
+  T.registerRequest(r2)
+  const result = await run
+  const written = JSON.parse(await fsp.readFile(path.join(bridgeDir, 'decision.json'), 'utf8'))
+  eq('rebind result written', result.written, true)
+  eq('rebind result request', result.request_id, 'r-rebind-000002')
+  eq('rebind decision request', written.request_id, 'r-rebind-000002')
+  eq('rebind decision choice', written.decision.choice.item_id, 22)
+}
+
+{
+  // §6.7 #2/#3：指纹变化时，旧结果必须丢弃而不是绑定到新请求。
+  resetPublish()
+  const r1 = freshState()
+  r1.request_id = 'r-fp-000001'
+  r1.ts = Date.now()
+  const r2 = freshState()
+  r2.request_id = 'r-fp-000002'
+  r2.ts = Date.now() + 10
+  r2.state.player.red_hearts = 0
+  const ctx = fakeLlmCtx([{
+    delayMs: 150,
+    text: '{"item_id":22,"reason":"旧指纹","confidence":0.9}',
+  }])
+  const run = T.runIsaacDecide({
+    config: { bridgeDir }, ctx, args: { state: r1 }, exec: fakeExec,
+  })
+  await sleep(20)
+  T.registerRequest(r2)
+  const result = await run
+  eq('fingerprint change discarded', result.discarded, true)
+  eq('fingerprint change reason', result.discard_reason, 'fingerprint_changed')
 }
 
 {
@@ -558,7 +635,7 @@ async function withBridgeEnv(dir, fn) {
 }
 
 {
-  // A) 模型忽略 AbortSignal：响应超过 validity，必须丢弃而不是写过期决策。
+  // D4：模型忽略 AbortSignal 时，isaac_decide 仍必须在硬截止内返回兜底 decision。
   resetPublish()
   const lateDir = path.join(tmpRoot, 'late-case')
   await fsp.mkdir(lateDir, { recursive: true })
@@ -566,6 +643,7 @@ async function withBridgeEnv(dir, fn) {
   state.request_id = 'r-late-000001'
   state.validity_ms = 600
   state.ts = Date.now()
+  const started = Date.now()
   const ctx = fakeLlmCtx([{
     delayMs: 700,
     text: '{"item_id":22,"reason":"迟到的模型结果","confidence":0.9}',
@@ -573,13 +651,71 @@ async function withBridgeEnv(dir, fn) {
   const result = await withBridgeEnv(lateDir, () => T.runIsaacDecide({
     config: { bridgeDir: lateDir }, ctx, args: { state }, exec: fakeExec,
   }))
-  const exists = await fsp.stat(path.join(lateDir, 'decision.json')).then(() => true).catch(() => false)
-  eq('late model result discarded', result.discarded, true)
-  eq('late model result reason', result.discard_reason, 'late')
-  eq('late model result error', result.error_code, 'TIMEOUT')
-  eq('late model result reason_code', result.reason_code, 'late')
-  eq('late model result not written', result.written, false)
-  eq('late model result leaves no decision', exists, false)
+  const elapsed = Date.now() - started
+  const decision = (await readJsonIfExists(path.join(lateDir, 'decision.json'))) ?? { decision: {} }
+  ok('late result returns before model resolves', elapsed < 650, String(elapsed))
+  eq('late result fallback written', result.written, true)
+  eq('late result fallback source', result.source, 'rule')
+  eq('late result fallback flag', result.fallback, true)
+  eq('late result fallback error', result.error_code, 'TIMEOUT')
+  eq('late result fallback reason_code', result.reason_code, 'timeout')
+  eq('late result decision source', decision.source ?? decision.decision?.source, 'rule')
+  eq('late result decision error', decision.error_code, 'TIMEOUT')
+
+  // 迟到的模型结果即使后来返回，也不得覆盖已写的兜底。
+  const decisionId = decision.decision_id
+  await sleep(800)
+  const after = (await readJsonIfExists(path.join(lateDir, 'decision.json'))) ?? { decision_id: null }
+  eq('late result does not overwrite fallback', after.decision_id, decisionId)
+}
+
+{
+  // D4：模型永不 resolve（忽略 AbortSignal）也必须按时返回兜底。
+  resetPublish()
+  const neverDir = path.join(tmpRoot, 'never-case')
+  await fsp.mkdir(neverDir, { recursive: true })
+  const state = freshState()
+  state.request_id = 'r-never-000001'
+  state.validity_ms = 600
+  state.ts = Date.now()
+  const neverCtx = {
+    get(name) {
+      if (name !== 'llm') return undefined
+      return {
+        stream() {
+          return {
+            [Symbol.asyncIterator]() {
+              return { next: () => new Promise(() => {}) }
+            },
+          }
+        },
+      }
+    },
+  }
+  const started = Date.now()
+  let result
+  let timedOut = false
+  try {
+    result = await Promise.race([
+      withBridgeEnv(neverDir, () => T.runIsaacDecide({
+        config: { bridgeDir: neverDir }, ctx: neverCtx, args: { state }, exec: fakeExec,
+      })),
+      sleep(1500).then(() => {
+        throw new Error('isaac_decide did not return')
+      }),
+    ])
+  } catch {
+    timedOut = true
+  }
+  const elapsed = Date.now() - started
+  eq('never-resolving model does not hang', timedOut, false)
+  ok('never-resolving model returns near deadline', elapsed < 800, String(elapsed))
+  eq('never-resolving fallback written', result?.written, true)
+  eq('never-resolving fallback flag', result?.fallback, true)
+  eq('never-resolving fallback error', result?.error_code, 'TIMEOUT')
+  const decision = (await readJsonIfExists(path.join(neverDir, 'decision.json'))) ?? { decision: {} }
+  eq('never-resolving decision source', decision.decision?.source, 'rule')
+  eq('never-resolving decision error', decision.error_code, 'TIMEOUT')
 }
 
 {
@@ -639,22 +775,34 @@ async function withBridgeEnv(dir, fn) {
 }
 
 {
-  // C) reason 按 UTF-8 字节截断：280 个 emoji 不能写出 1120 字节。
+  // D6：§1.6/§9 “超限即 VALIDATION/out_of_range，不得截断后继续”。
   const state = freshState()
-  const draft = T.normalizeDraft(
-    { item_id: 22, confidence: 0.8, reason: '😀'.repeat(280) },
-    state.state,
-  )
-  const doc = T.makeDecisionDoc(state, draft, {
-    source: 'llm',
-    providerId: 'llm:primary',
-    fallback: false,
+  let code = null
+  try {
+    T.normalizeDraft({ item_id: 22, confidence: 0.8, reason: '😀'.repeat(280) }, state.state)
+  } catch (error) {
+    code = error.reasonCode
+  }
+  eq('overlong reason rejected', code, 'invalid_reason')
+
+  resetPublish()
+  state.request_id = 'r-reason-000001'
+  const overlong = JSON.stringify({ item_id: 22, confidence: 0.8, reason: '😀'.repeat(280) })
+  const result = await T.runIsaacDecide({
+    config: { bridgeDir },
+    ctx: fakeLlmCtx([{ text: overlong }, { text: overlong }]),
+    args: { state },
+    exec: fakeExec,
   })
-  const chars = Array.from(doc.decision.reason).length
-  const bytes = Buffer.byteLength(doc.decision.reason, 'utf8')
-  ok('reason chars capped', chars <= 280, String(chars))
-  ok('reason bytes capped', bytes <= 1024, String(bytes))
-  ok('reason not empty after truncation', chars > 0 && bytes > 0, `${chars}/${bytes}`)
+  const decision = JSON.parse(await fsp.readFile(path.join(bridgeDir, 'decision.json'), 'utf8'))
+  const chars = Array.from(decision.decision.reason).length
+  const bytes = Buffer.byteLength(decision.decision.reason, 'utf8')
+  eq('overlong reason fallback', result.fallback, true)
+  eq('overlong reason error', result.error_code, 'VALIDATION')
+  eq('overlong reason code', result.reason_code, 'invalid_reason')
+  eq('overlong reason fallback source', decision.decision.source, 'rule')
+  ok('overlong fallback reason chars', chars <= 280, String(chars))
+  ok('overlong fallback reason bytes', bytes <= 1024, String(bytes))
 }
 
 // ── 12. draft.5：decision.session_id + plugin_status.json ────────────────────
