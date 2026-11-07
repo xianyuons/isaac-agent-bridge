@@ -9,6 +9,7 @@
 
 用法：
     python tests/run_lua_test.py
+    ISAAC_AGENT_LUA=53 python tests/run_lua_test.py     # 用 Lua 5.3（贴近游戏运行时）
 前置：
     python -m pip install lupa
 """
@@ -20,6 +21,13 @@ import string
 import subprocess
 import sys
 from pathlib import Path
+
+LUA_VARIANTS = {
+    "51": ("lua51", "Lua 5.1"),
+    "52": ("lua52", "Lua 5.2"),
+    "53": ("lua53", "Lua 5.3"),
+    "54": ("lua54", "Lua 5.4"),
+}
 
 
 def _free_drive() -> str | None:
@@ -46,17 +54,19 @@ def main() -> int:
         print(f"找不到测试脚本：{script}", file=sys.stderr)
         return 2
 
+    variant = os.environ.get("ISAAC_AGENT_LUA", "54")
+    module_name, label = LUA_VARIANTS.get(variant, LUA_VARIANTS["54"])
     try:
-        from lupa import lua54
+        lua = __import__(f"lupa.{module_name}", fromlist=[module_name])
     except ImportError:
         print(
-            "缺少 lupa（或本机没有 lua.exe）。安装：python -m pip install lupa；"
-            "或直接用 lua tests/lua_logic_test.lua 运行。",
+            f"缺少 lupa（或缺少 {label} 运行时 / 本机没有 lua.exe）。"
+            "安装：python -m pip install lupa；或直接用 lua tests/lua_logic_test.lua 运行。",
             file=sys.stderr,
         )
         return 2
 
-    runtime = lua54.LuaRuntime(unpack_returned_tuples=True)
+    runtime = lua.LuaRuntime(unpack_returned_tuples=True)
 
     # 非 ASCII 路径 → 临时 subst 盘符（Lua 的 C 文件 API 只认 ANSI）
     mapped = False
