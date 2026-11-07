@@ -1,22 +1,21 @@
 {
   "example": "03-timeout-late",
-  "summary": "生成时仍无决策（插件/模型未在有效期内响应）；mod 用本地规则 v1 兜底，结果与已生成的原版道具一致，无需 Morph。迟到决策在生成后到达，被丢弃，不改变已执行结果。",
+  "summary": "Boss 奖励预取未在生成前拿到任何决策；mod 在生成当帧用本地规则 v1 兜底。迟到决策在生成后到达，被丢弃，不改变已执行结果。",
   "assumptions": {
     "profile": "A",
-    "mode": "reactive（底座已生成，回调 62 返回 nil）",
+    "mode": "prefetch（预取）",
     "validity_ms": 1500,
-    "generation_at_ms": -30,
-    "fallback_at_ms": 1400,
+    "generation_at_ms": 1400,
     "late_received_at_ms": 1810,
     "expected_rule": "§6.5 R4：已持有道具无 damage 标签，候选有 damage -> 取 pedestal_index 最小的 damage 候选"
   },
   "timeline": [
-    { "t_ms": -30, "actor": "mod", "action": "写 event.json（pedestal_spawn, seq=61）；底座生成 4，回调 62 无决策返回 nil" },
+    { "t_ms": -20, "actor": "mod", "action": "写 event.json（boss_approach, seq=61）；进入 Boss 房，预取奖励池决策" },
     { "t_ms": 0, "actor": "mod", "action": "写 state.json（request_id=r-7f3a-000061, validity_ms=1500）" },
     { "t_ms": 50, "actor": "plugin", "action": "读到 state，开始 llm（内部超时 1100ms）" },
     { "t_ms": 1150, "actor": "plugin", "action": "llm 仍在跑；插件未来得及在该请求上降级写盘（示例故意模拟插件侧卡顿）" },
-    { "t_ms": 1400, "actor": "mod", "action": "无 eligible 决策 -> 本地规则 R4 选 4；与已生成的 4 相同，无需 Morph" },
-    { "t_ms": 1402, "actor": "mod", "action": "写 applied.json（applied_by=fallback, error_code=TIMEOUT, reason_code=no_fresh_decision）" },
+    { "t_ms": 1400, "actor": "mod", "action": "Boss 死亡，奖励池抽取；无 eligible 决策 -> 本地规则 R4 在当帧返回 4" },
+    { "t_ms": 1402, "actor": "mod", "action": "POST_PICKUP_INIT 核验实际生成 id=4；写 applied.json（applied_by=fallback, error_code=TIMEOUT, reason_code=no_fresh_decision）" },
     { "t_ms": 1420, "actor": "mod", "action": "气泡显示 [兜底] 本地规则：缺少输出，优先输出类" },
     { "t_ms": 1780, "actor": "agent", "action": "llm 返回 draft：item_id=2" },
     { "t_ms": 1800, "actor": "plugin", "action": "写 decision.json（valid=true, choice.item_id=2）" },
@@ -26,40 +25,36 @@
     "event.json": {
       "protocol_version": "1.0",
       "event_seq": 61,
-      "ts": 1793982719970,
-      "type": "pedestal_spawn",
+      "ts": 1793982719980,
+      "type": "boss_approach",
       "request_id": "r-7f3a-000061",
-      "payload": {
-        "pedestal_index": 0,
-        "item_id": 4,
-        "item_name": "Cricket's Head",
-        "room_type": "treasure"
-      }
+      "payload": { "boss_id": 63, "boss_name": "Monstro", "hp": 250, "max_hp": 250 }
     },
     "state.json": {
       "protocol_version": "1.0",
       "request_id": "r-7f3a-000061",
-      "gen_level_key": "f4:r52:treasure:p0:1b2c",
+      "gen_level_key": "f4:r52:boss:p0:1b2c",
       "ts": 1793982720000,
       "validity_ms": 1500,
       "error_code": null,
+      "reason_code": null,
       "features": ["transport:file_write", "hook:pre_get_collectible", "apply:prefetch"],
       "requires": [],
       "capabilities": ["transport:file_write", "transport:file_read", "hook:pre_get_collectible", "apply:prefetch"],
       "trigger": {
-        "type": "pedestal_spawn",
+        "type": "boss_approach",
         "event_seq": 61,
         "pedestal_index": 0,
-        "payload": { "item_id": 4, "pool": "treasure" }
+        "payload": { "boss_id": 63, "pool": "boss" }
       },
       "state": {
-        "player": { "red_hearts": 6, "soul_hearts": 0, "is_dead": false },
+        "player": { "red_hearts": 6, "soul_hearts": 0, "max_red_hearts": 6, "character_id": 0, "is_dead": false },
         "items": [
           { "id": 1, "name": "Sad Onion", "tags": ["tear"], "count": 1 }
         ],
-        "room": { "type": "treasure", "is_boss_room": false, "grid_index": 52, "is_clear": true },
+        "room": { "type": "boss", "is_boss_room": true, "grid_index": 52, "is_clear": false },
         "floor": 4,
-        "boss": null,
+        "boss": { "id": 63, "name": "Monstro", "hp": 250, "max_hp": 250 },
         "candidates": [
           { "pedestal_index": 0, "item_id": 4, "name": "Cricket's Head", "tags": ["damage"], "quality": 3 },
           { "pedestal_index": 0, "item_id": 2, "name": "The Inner Eye", "tags": ["tear"], "quality": 2 }
@@ -71,7 +66,7 @@
       "protocol_version": "1.0",
       "request_id": "r-7f3a-000061",
       "decision_id": "d-1b2c-000007",
-      "gen_level_key": "f4:r52:treasure:p0:1b2c",
+      "gen_level_key": "f4:r52:boss:p0:1b2c",
       "ts": 1793982721800,
       "error_code": null,
       "features": [],
@@ -91,7 +86,7 @@
     "applied.json": {
       "protocol_version": "1.0",
       "request_id": "r-7f3a-000061",
-      "gen_level_key": "f4:r52:treasure:p0:1b2c",
+      "gen_level_key": "f4:r52:boss:p0:1b2c",
       "ts": 1793982721402,
       "phase": "applied",
       "decision_id": null,
