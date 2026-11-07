@@ -34,6 +34,9 @@ tests/lua_logic_test.lua — isaac_agent 离线逻辑测试
   T28 capabilities 字段必须已删除（draft.4 统一为 features）
   T29 ts 毫秒精度（墙钟锚点 + 单调增量）
   T30 有效期边界按毫秒判定，且 ts 不参与
+  T31 session 不一致的 decision 拒收（session_mismatch），回执不得记 applied
+  T32 换局后旧 decision 拒收（on_game_end→进层 / startSeed 变化 两条路径）
+  T33 event / applied 落盘必须带 session_id
 
 运行：
   lua tests/lua_logic_test.lua
@@ -75,7 +78,7 @@ end
 -- 桩：Isaac / REPENTOGON / 游戏对象
 -- ============================================================
 local clock_ms = 100000
-local world = { stage = 2, room_index = 84, room_type = 4, stage_seed = 1234, frame = 100 }
+local world = { stage = 2, room_index = 84, room_type = 4, stage_seed = 1234, start_seed = 424242, frame = 100 }
 
 local VALID, CONFIG = {}, {}
 local IDS = {
@@ -127,7 +130,7 @@ local room_obj = {
 }
 local seeds_obj = {
     GetStageSeed = function() return world.stage_seed end,
-    GetStartSeed = function() return 424242 end,
+    GetStartSeed = function() return world.start_seed end,
 }
 local pool_obj = {
     IsCollectibleInPool = function(_, id) return POOL_HAS[id] == true end,
@@ -274,6 +277,7 @@ local function reset_world()
     world.room_index = 84
     world.room_type = 4          -- ROOM_TREASURE
     world.stage_seed = 1234
+    world.start_seed = 424242
     world.frame = 100
     player.hearts = 4
     player.soul = 2
@@ -316,6 +320,7 @@ local function decision_doc(rid, key, choice, overrides)
     DECISION_N = DECISION_N + 1
     local doc = {
         protocol_version = "1.0",
+        session_id = T.S.session_id,     -- draft.4 必填，且必须与当前会话一致
         request_id = rid,
         decision_id = string.format("d-test-%06d", DECISION_N),
         gen_level_key = key,
@@ -363,6 +368,7 @@ do
         local doc = T.decode(text)
         check(doc ~= nil, "state.json 必须是合法 JSON")
         eq(doc.protocol_version, "1.0", "protocol_version")
+        eq(doc.session_id, T.S.session_id, "state.session_id 应等于当前会话")
         eq(doc.request_id, rid, "request_id 应与返回一致")
         eq(doc.gen_level_key, key, "gen_level_key 应一致")
         eq(doc.validity_ms, 1500, "room_enter 的 validity_ms")
@@ -1031,6 +1037,90 @@ do
     publish(doc3)
     T.poll_decision()
     check(T.S.decision ~= nil, "ts 极旧但实际未过期，仍应接受（判定用单调毫秒）")
+end
+
+-- ============================================================
+-- T31 session 不一致的 decision 必须拒收（协议 §3.x / §6.3）
+-- ============================================================
+do
+    section("T31 session 不一致")
+    reset_world()
+    local rid, key = begin_request()
+    local cand = T.S.current.candidates[1].item_id
+    local doc = decision_doc(rid, key, { type = "item", item_id = cand })
+    doc.session_id = "s-deadbeef-0001"            -- 别的会话/旧进程
+    publish(doc)
+    T.poll_decision()
+    check(T.S.decision == nil, "session 不一致的决策不得接受")
+    eq(T.S.rejected and T.S.rejected.reason_code, "session_mismatch", "应按 session_mismatch 拒收")
+
+    local got = draw(0)
+    check(got ~= nil, "拒收后应走本地规则")
+    pickup(got)
+    local applied = read_applied()
+    eq(applied.applied_by, "fallback", "回执不得记成 llm/applied")
+    eq(applied.source, "rule", "回执 source 必须是 rule")
+end
+
+-- ============================================================
+-- T32 换局后旧 decision 必须拒收（session 必须变）
+-- ============================================================
+do
+    section("T32 换局旧决策")
+    reset_world()
+    local rid, key = begin_request()
+    local cand = T.S.current.candidates[1].item_id
+    publish(decision_doc(rid, key, { type = "item", item_id = cand }))
+    local old_session = T.S.session_id
+    check(old_session ~= nil, "应有当前会话 id")
+
+    -- 本局结束 → 下一次进层：必须换会话并清空旧局在途
+    M.hooks.on_game_end()
+    M.hooks.on_new_level()
+    check(T.S.session_id ~= nil and T.S.session_id ~= old_session, "换局后 session_id 必须变化")
+    eq(T.S.outstanding_n, 0, "换局后旧局在途请求必须清空")
+
+    T.poll_decision()
+    check(T.S.decision == nil, "旧局决策不得被新局接受")
+    eq(T.S.rejected and T.S.rejected.reason_code, "session_mismatch", "应按 session_mismatch 拒收")
+
+    -- 另一条换局路径：startSeed 变化（同进程直接开新局）
+    reset_world()
+    begin_request()
+    local s2 = T.S.session_id
+    world.start_seed = 999999
+    M.hooks.on_new_level()
+    check(T.S.session_id ~= s2, "startSeed 变化也必须换会话")
+end
+
+-- ============================================================
+-- T33 event / applied 落盘必须带 session_id
+-- ============================================================
+do
+    section("T33 文档带 session_id")
+    reset_world()
+    M.hooks.on_new_room()                          -- 触发 room_enter 事件
+    T.flush_writes()
+    local ev = T.decode(read_file(bpath("event.json")))
+    check(ev ~= nil, "event.json 应存在")
+    if ev ~= nil then
+        eq(ev.session_id, T.S.session_id, "event.session_id 应等于当前会话")
+        check(type(ev.session_id) == "string" and ev.session_id:match("^[A-Za-z0-9_%-]+$") ~= nil,
+            "session_id 格式必须匹配 ^[A-Za-z0-9_-]{8,64}$")
+    end
+
+    local rid = T.S.current.request_id
+    local key = T.S.current.gen_level_key
+    local cand = T.S.current.candidates[1].item_id
+    publish(decision_doc(rid, key, { type = "item", item_id = cand }))
+    T.poll_decision()
+    local got = draw(0)
+    pickup(got)
+    local applied = read_applied()
+    check(applied ~= nil, "applied.json 应存在")
+    if applied ~= nil then
+        eq(applied.session_id, T.S.session_id, "applied.session_id 应等于当前会话")
+    end
 end
 
 -- ============================================================

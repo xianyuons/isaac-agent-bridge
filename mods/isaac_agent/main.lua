@@ -29,6 +29,11 @@ isaac_agent — 游戏侧 Lua mod（依赖 REPENTOGON / Repentance+）
 时间：超时判定一律用 Isaac.GetTime() 的单调毫秒。对外 `ts` 用“墙钟锚点 + 单调增量”：
      观察到 os.time() 秒跳变时记锚点，之后 ts 精确到毫秒（x_clock="epoch"）；
      尚未对齐时为秒级（x_clock="epoch_second"）；没有 os 时用单调值（x_clock="monotonic"）。
+
+会话：`session_id` 是 draft.4 起必填字段（^[A-Za-z0-9_-]{8,64}$）。同一局内稳定，
+     每次都写进 state / event / applied；**重启、读档、换局（startSeed 变化或
+     上一局结束）必须变化**。消费 decision 时校验 `decision.session_id`，
+     不一致按 `VALIDATION/session_mismatch` 拒收，避免旧局决策串进新局。
 ============================================================================ ]]
 
 local MOD_NAME = "isaac_agent"
@@ -511,6 +516,12 @@ local S = {
     counter = 0,
     profile = "none",
 
+    -- 本局会话 id（协议 §1.5/§2.1：必填、^[A-Za-z0-9_-]{8,64}$、同局稳定、重启/读档/换局变化）
+    session_id = nil,
+    session_seq = 0,
+    run_start_seed = nil,        -- 本局 startSeed：变了就说明换局
+    pending_new_session = false, -- on_game_end 之后、下一次进层之前：必须换会话
+
     validity_ms = DEFAULT_VALIDITY_MS,
     decision = nil,          -- { doc = table, received_ms = number }
     rejected = nil,          -- 最近一次被拒的决策（用于 applied 审计）
@@ -573,6 +584,48 @@ local function log_limited(level, module, key, msg, fields)
         S.error_seq = 0
     end
     log(level, module, msg, fields)
+end
+
+-- 会话 id（协议 §1.5/§2.1）。三条硬要求：
+--   ① 必填且格式合法（s-<boot>-<seq>，全是字母数字与连字符）；
+--   ② 同一局内稳定（每次写 state/event/applied 都带同一个值）；
+--   ③ 重启 / 读档 / 换局必须变化 —— 否则上一局的 decision 会被本局当有效决策用掉。
+-- 换会话时旧局的一切（在途请求、缓存决策、已消费记录、待核验回执）同时作废。
+local finalize_pending_verify    -- 前向声明（实现见“未核验回执结算”一节）
+
+local function make_session_id()
+    S.session_seq = (S.session_seq or 0) + 1
+    return string.format("s-%s-%04d", tostring(S.boot or "0000"), S.session_seq)
+end
+
+local function rotate_session(reason)
+    local old = S.session_id
+    S.session_id = make_session_id()
+    S.decision = nil
+    S.outstanding, S.outstanding_n = {}, 0
+    S.consumed_requests, S.consumed_n = {}, 0
+    S.seen_decisions, S.seen_order = {}, {}
+    S.current = nil
+    if S.pending_verify ~= nil and finalize_pending_verify ~= nil then
+        finalize_pending_verify(nil, "not_applied")
+    end
+    S.pending_verify = nil
+    log("info", "session", string.format("会话切换 %s → %s（%s）",
+        tostring(old), tostring(S.session_id), tostring(reason or "?")))
+end
+
+-- 换局判据：startSeed 变了 / on_game_end 之后第一次进层 / 从未初始化。
+-- 读档在同一进程里通常表现为 on_game_start 再次触发（那里会强制换会话）。
+local function ensure_session(start_seed, reason)
+    local need = (S.session_id == nil)
+        or S.pending_new_session == true
+        or (start_seed ~= nil and S.run_start_seed ~= nil and start_seed ~= S.run_start_seed)
+    if need then
+        rotate_session(reason or "new-run")
+        S.pending_new_session = false
+    end
+    if start_seed ~= nil then S.run_start_seed = start_seed end
+    return S.session_id
 end
 
 -- ============================================================
@@ -1021,7 +1074,7 @@ local function item_tags(id)
 end
 
 local function read_level()
-    local lv = { floor = 0, grid = -1, room_type = 0, is_boss = false, stage_seed = 0 }
+    local lv = { floor = 0, grid = -1, room_type = 0, is_boss = false, stage_seed = 0, start_seed = nil }
     pcall(function()
         local level = Game():GetLevel()
         lv.floor = clamp_int(level:GetStage(), 0, 63, 0)
@@ -1030,6 +1083,9 @@ local function read_level()
         local seeds = Game():GetSeeds()
         local ok, s = pcall(function() return seeds:GetStageSeed() end)
         if ok and type(s) == "number" then lv.stage_seed = s end
+        -- startSeed 用来识别“换了一局”（同 stage 编号在不同局会重复，不能只看层）
+        local ok2, start = pcall(function() return seeds:GetStartSeed() end)
+        if ok2 and type(start) == "number" then lv.start_seed = start end
     end)
     pcall(function()
         local room = Game():GetRoom()
@@ -1261,7 +1317,7 @@ local function build_state_doc(request_id, gen_key, trigger_type, pool_name, can
 
     local doc = {
         protocol_version = PROTOCOL_VERSION,
-        session_id = "s-" .. tostring(S.boot) .. "-0001",
+        session_id = S.session_id or "",
         request_id = request_id,
         gen_level_key = gen_key,
         ts = ts,
@@ -1306,6 +1362,7 @@ end
 -- 写请求：v1 在换层/进房/Boss 前 + 等待期间按 validity/2 刷新（协议 §1.5、§6.1）
 local function request_state(trigger_type, pool_name)
     local t = now_ms()
+    ensure_session(nil, "request")     -- 没有任何钩子跑过时也要有合法 session_id
     local candidates = ensure_candidates(pool_name)
     local gen_key = make_gen_level_key(pool_name, candidates)
     local request_id = next_request_id()
@@ -1396,6 +1453,16 @@ local function validate_decision(doc, ctx)
         if doc[f] == nil or doc[f] == JSON_NULL then
             return false, "VALIDATION", "missing_field"
         end
+    end
+    -- 会话（协议 §3.x / §6.3）：旧局/旧进程的决策一律拒收，不能让它跨局生效
+    if doc.session_id == nil or doc.session_id == JSON_NULL then
+        return false, "VALIDATION", "missing_field"
+    end
+    if type(doc.session_id) ~= "string" then
+        return false, "VALIDATION", "invalid_type"
+    end
+    if doc.session_id ~= S.session_id then
+        return false, "VALIDATION", "session_mismatch"
     end
     if type(doc.valid) ~= "boolean" then return false, "VALIDATION", "missing_field" end
     if type(doc.decision) ~= "table" then return false, "VALIDATION", "missing_field" end
@@ -1574,6 +1641,13 @@ local function poll_decision()
     -- 重复投递：相同 decision_id 直接忽略（协议 §6.7.6）
     if decision_already_seen(doc.decision_id) then return end
 
+    -- 会话先判：旧局/旧进程的决策在“在途表里找不到请求”之前就要定性为 session_mismatch，
+    -- 否则会被误报成 request_mismatch（诊断上会指向错误的方向）。
+    if type(doc.session_id) == "string" and doc.session_id ~= S.session_id then
+        reject_decision(doc, "VALIDATION", "session_mismatch")
+        return
+    end
+
     local t = now_ms()
     -- 找这条决策对应的在途请求；找不到 = 旧回合/别家（request_mismatch），
     -- 或者该请求已经被用掉了（生成之后才到 → late，协议 §6.3）
@@ -1737,6 +1811,7 @@ local function build_applied_doc(rec)
     local ts, _ = doc_ts()
     return {
         protocol_version = PROTOCOL_VERSION,
+        session_id = rec.session_id or S.session_id or "",
         request_id = rec.request_id or JSON_NULL,
         gen_level_key = rec.gen_level_key or JSON_NULL,
         ts = ts,
@@ -1802,6 +1877,7 @@ local function emit_event(etype, payload, request_id)
     local ts, _ = doc_ts()
     local doc = {
         protocol_version = PROTOCOL_VERSION,
+        session_id = S.session_id or "",
         event_seq = S.event_seq,
         ts = ts,
         type = etype,
@@ -1937,6 +2013,8 @@ local function make_applied_from_decision(doc, gen_key, pedestal_index)
         request_id = doc.request_id,
         gen_level_key = gen_key,
         decision_id = doc.decision_id,
+        -- 回执属于“生成发生时”的会话：换局结算旧回执时不能记到新会话头上
+        session_id = S.session_id,
         source = d.source,
         provider_id = d.provider_id,
         fallback = (d.fallback == true),
@@ -1988,6 +2066,7 @@ local function make_applied_local(rule, gen_key, pedestal_index, reason_code_ove
         pedestal_index = pedestal_index,
         latency_ms = nil,
         actual_item_id = nil,
+        session_id = S.session_id,
     }
     rec.applied_by = "fallback"
     return rec
@@ -2125,6 +2204,14 @@ local function on_game_start()
     S.event_seq = 0
     CLOCK.last_os, CLOCK.epoch_base, CLOCK.mono_base, CLOCK.synced = nil, nil, nil, false
 
+    -- 新的一次 game start（新局 / 读档 / 进程重启）必须是新会话：
+    -- 旧局的 decision 即使还在 decision.json 里，也会因 session_mismatch 被拒。
+    S.session_seq = 0
+    S.session_id = nil
+    S.run_start_seed = nil
+    S.pending_new_session = false
+    rotate_session("game-start")
+
     bridge_detect()
     load_tags()
     log("info", "start", string.format(
@@ -2134,6 +2221,7 @@ end
 
 local function on_new_level()
     S.level = read_level()
+    ensure_session(S.level.start_seed, "new-level")
     S.cand_cache = {}            -- 候选签名含层信息，换层重建
     S.items_cache = nil
     S.next_pedestal_index = 0
@@ -2144,6 +2232,7 @@ end
 
 local function on_new_room()
     S.level = read_level()
+    ensure_session(S.level.start_seed, "new-room")
     S.next_pedestal_index = 0
     S.decision = nil
 
@@ -2165,7 +2254,7 @@ end
 -- 回调 62：池抽取完成、底座生成之前
 -- 未核验回执的结算：核验失败 / 超窗 / 被新的生成覆盖时，按协议 §5.4 行 3 写 rejected。
 -- 关键不变量：**核验通过之前绝不写“成功”回执**；结算时 applied_by 只能是 none。
-local function finalize_pending_verify(actual_item_id, reason_code)
+finalize_pending_verify = function(actual_item_id, reason_code)
     local pv = S.pending_verify
     if pv == nil then return end
     S.pending_verify = nil
@@ -2317,6 +2406,8 @@ local function on_render()
 end
 
 local function on_game_end()
+    -- 本局结束：下一次进层必须换会话（同进程里“退到菜单再继续”也走这条）
+    S.pending_new_session = true
     S.decision = nil
     S.outstanding = {}
     S.outstanding_n = 0
@@ -2425,6 +2516,8 @@ return {
             S.next_pedestal_index = 0
             S.cand_cache = {}
             S.items_cache = nil
+            S.session_id, S.session_seq = nil, 0
+            S.run_start_seed, S.pending_new_session = nil, false
             Pending.state, Pending.event, Pending.applied = nil, nil, nil
             CLOCK.last_os, CLOCK.epoch_base, CLOCK.mono_base, CLOCK.synced = nil, nil, nil, false
         end,
