@@ -1,0 +1,116 @@
+{
+  "example": "02-fallback-invalid-id",
+  "summary": "反应式兜底：reroll 时底座已生成 4（回调 62 无决策，返回 nil）；插件给出候选池外的 id=999，mod 拒绝后按本地规则把底座 Morph 成 22。applied_by=fallback。",
+  "assumptions": {
+    "profile": "A",
+    "mode": "reactive + Morph（反应式）",
+    "validity_ms": 1500,
+    "morph_at_ms": 1400,
+    "expected_rule": "§6.5 R3：red_hearts==0 且存在 heal 候选 -> pedestal_index 最小的 heal 候选"
+  },
+  "timeline": [
+    { "t_ms": -30, "actor": "mod", "action": "写 event.json（reroll, seq=57）；底座已重掷生成 4，回调 62 无决策返回 nil" },
+    { "t_ms": 0, "actor": "mod", "action": "写 state.json（request_id=r-7f3a-000057）" },
+    { "t_ms": 40, "actor": "plugin", "action": "读到 state，调用 llm" },
+    { "t_ms": 880, "actor": "plugin", "action": "写 decision.json（valid=true, choice.item_id=999）" },
+    { "t_ms": 900, "actor": "mod", "action": "读到决策；校验失败：999 不在 candidates -> 拒绝，reason_code=invalid_choice" },
+    { "t_ms": 1400, "actor": "mod", "action": "本地规则 R3 选 22；用 Morph 把底座替换为 22（反应式兜底）" },
+    { "t_ms": 1402, "actor": "mod", "action": "写 applied.json（applied_by=fallback, error_code=VALIDATION, reason_code=invalid_choice）" },
+    { "t_ms": 1420, "actor": "mod", "action": "气泡显示 [兜底] 本地规则：红心归零，优先回血" }
+  ],
+  "files": {
+    "event.json": {
+      "protocol_version": "1.0",
+      "event_seq": 57,
+      "ts": 1793982659970,
+      "type": "reroll",
+      "request_id": "r-7f3a-000057",
+      "payload": {
+        "pedestal_index": 0,
+        "before": [{ "pedestal_index": 0, "item_id": 1 }],
+        "after": [
+          { "pedestal_index": 0, "item_id": 4 },
+          { "pedestal_index": 0, "item_id": 22 }
+        ],
+        "gen_level_key": "f3:r31:treasure:p0:77aa"
+      }
+    },
+    "state.json": {
+      "protocol_version": "1.0",
+      "request_id": "r-7f3a-000057",
+      "gen_level_key": "f3:r31:treasure:p0:77aa",
+      "ts": 1793982660000,
+      "validity_ms": 1500,
+      "error_code": null,
+      "features": ["transport:file_write", "hook:pre_get_collectible", "apply:morph"],
+      "requires": [],
+      "capabilities": ["transport:file_write", "transport:file_read", "hook:pre_get_collectible", "apply:morph"],
+      "trigger": {
+        "type": "reroll",
+        "event_seq": 57,
+        "pedestal_index": 0,
+        "payload": { "before_item_id": 1, "pool": "treasure" }
+      },
+      "state": {
+        "player": { "red_hearts": 0, "soul_hearts": 2, "is_dead": false },
+        "items": [
+          { "id": 1, "name": "Sad Onion", "tags": ["tear"], "count": 1 }
+        ],
+        "room": { "type": "treasure", "is_boss_room": false, "grid_index": 31, "is_clear": true },
+        "floor": 3,
+        "boss": null,
+        "candidates": [
+          { "pedestal_index": 0, "item_id": 4, "name": "Cricket's Head", "tags": ["damage"], "quality": 3 },
+          { "pedestal_index": 0, "item_id": 22, "name": "Breakfast", "tags": ["heal"], "quality": 1 }
+        ],
+        "mod": { "name": "isaac_agent", "version": "0.1.0" }
+      }
+    },
+    "decision.json": {
+      "protocol_version": "1.0",
+      "request_id": "r-7f3a-000057",
+      "decision_id": "d-77aa-000003",
+      "gen_level_key": "f3:r31:treasure:p0:77aa",
+      "ts": 1793982660880,
+      "error_code": null,
+      "features": [],
+      "requires": [],
+      "valid": true,
+      "decision": {
+        "choice": { "type": "item", "item_id": 999 },
+        "reason": "这个道具很强",
+        "confidence": 0.93,
+        "fallback": false,
+        "source": "llm",
+        "provider_id": "llm:primary",
+        "reason_code": null,
+        "elapsed_ms": 820
+      }
+    },
+    "applied.json": {
+      "protocol_version": "1.0",
+      "request_id": "r-7f3a-000057",
+      "gen_level_key": "f3:r31:treasure:p0:77aa",
+      "ts": 1793982661402,
+      "phase": "applied",
+      "decision_id": "d-77aa-000003",
+      "source": "rule",
+      "provider_id": "rule:local",
+      "fallback": true,
+      "applied_by": "fallback",
+      "error_code": "VALIDATION",
+      "reason_code": "invalid_choice",
+      "choice": { "type": "item", "item_id": 22 },
+      "reason": "本地规则：红心归零，优先回血",
+      "latency_ms": 880,
+      "pedestal_index": 0,
+      "actual_item_id": 22
+    }
+  },
+  "logs": [
+    "INFO plugin/orchestrator request=r-7f3a-000057 provider=llm:primary elapsed=820ms",
+    "WARN mod/decision request=r-7f3a-000057 decision=d-77aa-000003 rejected reason_code=invalid_choice detail=999 not in candidates",
+    "INFO mod/fallback request=r-7f3a-000057 rule=rule:local choice=22 reason_code=invalid_choice mode=morph",
+    "INFO mod/applied request=r-7f3a-000057 decision=d-77aa-000003 actual=22 applied_by=fallback latency=880ms"
+  ]
+}
