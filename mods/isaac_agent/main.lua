@@ -19,6 +19,8 @@ isaac_agent — 游戏侧 Lua mod（依赖 REPENTOGON / Repentance+）
   ⚠ 实测约束：原版 REPENTOGON 沙箱不提供 io/os（参考实现亦只在 Mod:SaveData 上搭桥），
     因此 Profile A 目前需要 `--luadebug` 启动项，或等 REPENTOGON 暴露文件 API。
     桥目录由插件侧创建（mod 只探测、不调 shell、不建目录）。
+    桥目录里的 `.isaac_agent_owner` 是 mod 的所有者令牌：每次写入前后都会校验它，
+    插件侧 **不得删除或改写** 这个文件（否则 mod 会判定目录被替换并停止写入）。
     探针失败 **不会** 让游戏坏掉：退回本地规则，并在气泡/日志里说明。
   ⚠ Profile C（SaveData 中继）按协议 §1.4 属研究形态、默认关闭，本版不实现。
 
@@ -488,6 +490,10 @@ local S = {
     pending_verify = nil,    -- 等待 POST_PICKUP_INIT 核验的记录
     seen_decisions = {},     -- decision_id -> true
     seen_order = {},
+    -- 已消费的 request_id：消费即作废（协议 §6.7.5）。迟到的同 request 决策按 late 拒绝，
+    -- 不能因为“它还在 outstanding 里”就再被下一次生成用掉。
+    consumed_requests = {},
+    consumed_n = 0,
 
     bubble = { text = "", until_ms = 0, fallback = false, ascii = "" },
     font = { tried = false, ok = false, obj = nil },
@@ -563,11 +569,52 @@ local function join_path(dir, name)
     return dir .. "\\" .. name
 end
 
--- 原子写：同目录唯一 tmp → write/flush/close → rename（Windows 上先 remove 目标）
+-- 目录所有权令牌：探针时写入，之后每次写入前后各校验一次。
+-- 防 TOCTOU：探测时的 <bridge> 与真正写入时的 <bridge> 可能已被替换（改名/junction）。
+local OWNER_FILE = ".isaac_agent_owner"
+
+local function bridge_read_owner()
+    if Bridge.dir == nil then return nil end
+    local f = io.open(join_path(Bridge.dir, OWNER_FILE), "rb")
+    if f == nil then return nil end
+    local text = f:read("*a")
+    f:close()
+    return text
+end
+
+local function bridge_verify_dir()
+    if Bridge.dir == nil then return false, "no_dir" end
+    if Bridge.owner == nil or Bridge.owner == "" then return false, "no_owner" end
+    local text = bridge_read_owner()
+    if text == nil then return false, "owner_missing" end
+    if text ~= Bridge.owner then return false, "owner_mismatch" end
+    return true, nil
+end
+
+local function bridge_downgrade(reason)
+    Bridge.can_write = false
+    Bridge.can_read = false
+    Bridge.kind = "none"
+    S.profile = "none"
+    log_limited("error", "bridge", "downgrade_" .. tostring(reason),
+        "桥目录校验失败（" .. tostring(reason) .. "）→ 停止写入并降级为本地规则",
+        { error_code = "IO", reason_code = "io_error" })
+end
+
+-- 原子写：同目录唯一 tmp → 旧文件挪 .bak → rename → 双校验 → 删 .bak。
+-- 不变量：任何失败路径都必须保留旧文件（宁可不更新，也不能丢）。
 local function bridge_write_raw(name, text)
     if not Bridge.can_write or Bridge.dir == nil then
         return false, "bridge_unavailable"
     end
+
+    -- ① 写前校验父目录仍是探针时那个（TOCTOU）
+    local ok_dir, dir_err = bridge_verify_dir()
+    if not ok_dir then
+        bridge_downgrade(dir_err)
+        return false, "io_error"
+    end
+
     Bridge.seq = Bridge.seq + 1
     local tmp = join_path(Bridge.dir,
         name .. ".tmp." .. tostring(Bridge.boot) .. "." .. tostring(Bridge.seq))
@@ -583,15 +630,57 @@ local function bridge_write_raw(name, text)
         pcall(function() os.remove(tmp) end)
         return false, "io_error"
     end
+
     local target = join_path(Bridge.dir, name)
+    local bak = target .. ".bak"
+
+    -- ② 先把旧文件挪到 .bak（不是删除）；挪不动就放弃这次更新，旧文件原封不动
+    local had_old = false
+    local tf = io.open(target, "rb")
+    if tf ~= nil then
+        tf:close()
+        had_old = true
+        pcall(function() os.remove(bak) end)
+        if not os.rename(target, bak) then
+            pcall(function() os.remove(tmp) end)
+            Bridge.last_error = "backup_failed"
+            return false, "io_error"
+        end
+    end
+
     local okr = os.rename(tmp, target)
     if not okr then
-        -- Windows: rename 到已存在目标会失败 → 删旧再改名（协议 §1.3 允许）
-        pcall(function() os.remove(target) end)
-        okr = os.rename(tmp, target)
-    end
-    if not okr then
+        -- 回滚：把 .bak 改回原名（协议 §1.3：失败必须保留旧文件）
+        if had_old then
+            if not os.rename(bak, target) then
+                log_limited("error", "bridge", "restore_fail",
+                    "旧文件恢复失败，原文件保留在 " .. tostring(bak),
+                    { error_code = "IO", reason_code = "io_error" })
+            end
+        end
         pcall(function() os.remove(tmp) end)
+        Bridge.last_error = "rename_failed"
+        return false, "io_error"
+    end
+    if had_old then pcall(function() os.remove(bak) end) end
+
+    -- ③ 写后校验：目录没被换掉，且落盘内容与预期一致（防“写到了被替换的目录”）
+    local ok_after, after_err = bridge_verify_dir()
+    if not ok_after then
+        bridge_downgrade(after_err)
+        return false, "io_error"
+    end
+    local rf = io.open(target, "rb")
+    if rf == nil then
+        Bridge.last_error = "verify_open_failed"
+        return false, "io_error"
+    end
+    local back = rf:read("*a")
+    rf:close()
+    if back ~= text then
+        Bridge.last_error = "verify_mismatch"
+        log_limited("error", "bridge", "verify_mismatch",
+            "写入校验失败：落盘内容与预期不一致", { error_code = "IO", reason_code = "io_error" })
         return false, "io_error"
     end
     return true, nil
@@ -632,6 +721,21 @@ local function bridge_probe_dir(dir)
     -- 读 decision.json 的权限单独探测：不存在视为“可读待创建”（协议 §1.8）
     local df = io.open(join_path(dir, "decision.json"), "rb")
     if df ~= nil then df:close() end
+
+    -- 目录所有权令牌：之后每次写入前后都校验它，防父目录在探测后被替换（TOCTOU）
+    local token = tostring(Bridge.boot) .. ":" ..
+        hex8(hash_num(tostring(now_ms()) .. "|" .. tostring(math.random(0, 999999)) .. "|" .. tostring(dir)))
+    local of = io.open(join_path(dir, OWNER_FILE), "wb")
+    if of == nil then return false, "owner_write_failed" end
+    of:write(token)
+    of:flush()
+    of:close()
+    local ck = io.open(join_path(dir, OWNER_FILE), "rb")
+    if ck == nil then return false, "owner_readback_failed" end
+    local token_back = ck:read("*a")
+    ck:close()
+    if token_back ~= token then return false, "owner_readback_mismatch" end
+    Bridge.owner = token
     return true, nil
 end
 
@@ -640,6 +744,7 @@ local function bridge_detect(opts)
     opts = opts or {}
     Bridge.boot = S.boot
     Bridge.dir = nil
+    Bridge.owner = nil
     Bridge.can_write = false
     Bridge.can_read = false
     Bridge.last_error = nil
@@ -1369,7 +1474,13 @@ local function validate_decision(doc, ctx)
 end
 
 local function accept_decision(doc, ctx, t)
-    S.decision = { doc = doc, received_ms = t, ctx = ctx }
+    S.decision = {
+        doc = doc,
+        received_ms = t,
+        request_id = doc.request_id,
+        gen_level_key = doc.gen_level_key,
+        ctx = ctx,
+    }
     next_decision_seen(doc.decision_id)
     S.stats.hits = S.stats.hits + 1
     log("info", "decision", string.format(
@@ -1422,10 +1533,15 @@ local function poll_decision()
     if decision_already_seen(doc.decision_id) then return end
 
     local t = now_ms()
-    -- 找这条决策对应的在途请求；找不到 = 旧回合/别家（request_mismatch）
+    -- 找这条决策对应的在途请求；找不到 = 旧回合/别家（request_mismatch），
+    -- 或者该请求已经被用掉了（生成之后才到 → late，协议 §6.3）
     local out = S.outstanding[doc.request_id]
     if out == nil then
-        reject_decision(doc, "VALIDATION", "request_mismatch")
+        if S.consumed_requests[doc.request_id] then
+            reject_decision(doc, "TIMEOUT", "late")
+        else
+            reject_decision(doc, "VALIDATION", "request_mismatch")
+        end
         return
     end
 
@@ -1835,25 +1951,51 @@ local function make_applied_local(rule, gen_key, pedestal_index, reason_code_ove
     return rec
 end
 
+-- 决策是否仍可用：必须同时满足
+--   ① 请求仍在在途表（未被消费/未被清理）；② K 与请求一致；③ 未过有效期。
+-- 缓存的失效判据就在这里，不能只看“收到过一条决策”。
+local function decision_is_fresh(d, t)
+    if d == nil then return false end
+    local out = S.outstanding[d.request_id]
+    if out == nil then return false end
+    if d.gen_level_key ~= out.gen_level_key then return false end
+    if type(d.received_ms) ~= "number" then return false end
+    t = t or now_ms()
+    if t < d.received_ms then return false end
+    return (t - out.sent_ms) <= (out.validity or S.validity_ms)
+end
+
 -- 生成当帧：优先用内存里的新鲜决策，否则本地规则（协议 §6.2）
 local function consume(pool_name, gen_key, candidates)
     local t = now_ms()
     local d = S.decision
     if d ~= nil then
         local doc = d.doc
-        local out = S.outstanding[doc.request_id]
-        local fresh = (out ~= nil) and ((t - out.sent_ms) <= (out.validity or S.validity_ms))
         local same_target = (doc.gen_level_key == gen_key)
+        local fresh = decision_is_fresh(d, t)
         if same_target and fresh then
-            S.decision = nil                    -- 消费一次即作废（协议 §6.7.5）
-            if S.current ~= nil then S.current.refreshes = 0 end
+            -- 先算回执（latency 要读在途记录的 sent_ms），再作废请求
+            local rec = make_applied_from_decision(doc, gen_key, S.ped_index)
+            local item_id = nil
             if doc.decision.choice.type == "item" then
-                S.stats.draws = S.stats.draws + 1
-                return doc.decision.choice.item_id, make_applied_from_decision(doc, gen_key, S.ped_index)
+                item_id = doc.decision.choice.item_id
             end
-            -- action: skip
+
+            -- 消费一次即作废（协议 §6.7.5）：
+            --   ① 该 request 立刻移出在途表；② 记住它已消费 → 迟到决策按 late 拒绝。
+            -- 不这么做的话，同一 request 的新 decision_id 会继续被接受，
+            -- 下一次生成又记成 llm（重复消费 / 归属错）。
+            S.outstanding[doc.request_id] = nil
+            S.outstanding_n = math.max(0, (S.outstanding_n or 0) - 1)
+            S.consumed_requests[doc.request_id] = true
+            S.consumed_n = (S.consumed_n or 0) + 1
+            if S.consumed_n > 256 then
+                S.consumed_requests, S.consumed_n = {}, 0
+            end
+            S.decision = nil
+            if S.current ~= nil then S.current.refreshes = 0 end
             S.stats.draws = S.stats.draws + 1
-            return nil, make_applied_from_decision(doc, gen_key, S.ped_index)
+            return item_id, rec
         end
         -- 过期或跨目标：丢弃，不留给下一次生成
         if same_target and not fresh then
@@ -1921,6 +2063,7 @@ local function on_game_start()
     S.next_pedestal_index = 0
     S.pending_verify = nil
     S.seen_decisions, S.seen_order = {}, {}
+    S.consumed_requests, S.consumed_n = {}, 0
     S.event_seq = 0
 
     bridge_detect()
@@ -2030,9 +2173,15 @@ local function on_pickup_init(_, pickup)
             sub, tostring(pv.applied.decision_id)),
             { request_id = pv.applied.request_id, decision_id = pv.applied.decision_id })
     else
-        -- 决策没真正生效（别的来源覆盖 / 未生成）→ 按协议 §5.4 写 rejected/none
+        -- 决策没真正生效（别的来源覆盖 / 未生成）
+        -- 协议 §5.4 行 3：rejected ⇒ applied_by=none、choice=null、source=null、
+        -- provider_id=null、fallback=true。保留 llm/item/fallback=false 会让回执自相矛盾。
         pv.applied.phase = "rejected"
         pv.applied.applied_by = "none"
+        pv.applied.source = nil
+        pv.applied.provider_id = nil
+        pv.applied.fallback = true
+        pv.applied.choice = nil
         pv.applied.error_code = "INTERNAL"
         pv.applied.reason_code = "not_applied"
         pv.applied.actual_item_id = sub
@@ -2056,6 +2205,14 @@ local function on_update()
 
     poll_decision()
     prune_outstanding()
+
+    -- 缓存过期就丢掉：否则 S.decision 非空会一直压住刷新（协议 §6.7.4 / §6.7.8），
+    -- 新请求发不出去，下一个底座只能吃旧决策或兜底。
+    if S.decision ~= nil and not decision_is_fresh(S.decision) then
+        S.decision = nil
+        log_limited("info", "cache", "stale_decision",
+            "缓存决策已过期 → 丢弃并恢复刷新", { reason_code = "no_fresh_decision" })
+    end
 
     -- 刷新：等待生成期间每 validity/2 发一次新请求（同 K，新 request_id），
     -- 有上限：对端一直不回时不能无限重发（每 K 最多 MAX_REFRESHES 次）
@@ -2164,6 +2321,7 @@ return {
         ensure_candidates = ensure_candidates,
         write_applied = write_applied,
         flush_writes = flush_writes,
+        decision_is_fresh = decision_is_fresh,
         consume = consume,
         reset = function()
             S.decision = nil
@@ -2173,6 +2331,7 @@ return {
             S.current = nil
             S.pending_verify = nil
             S.seen_decisions, S.seen_order = {}, {}
+            S.consumed_requests, S.consumed_n = {}, 0
             S.stats = { draws = 0, hits = 0, fallback = 0, rejected = 0, timeout = 0, io_err = 0 }
             S.next_pedestal_index = 0
             S.cand_cache = {}
