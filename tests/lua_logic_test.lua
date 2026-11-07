@@ -20,6 +20,14 @@ tests/lua_logic_test.lua — isaac_agent 离线逻辑测试
   T14 本地规则：默认分支 → 数组第一个候选
   T15 Profile none（无文件能力）→ 本地规则 + 气泡写明“桥接不可用”
   T16 无中文字体时渲染不抛错（ASCII 降级）
+  T17 回调内零磁盘 I/O（落盘只在 on_update）
+  T18 重复 decision_id 忽略
+  T19 Boss 房预取（trigger/validity/payload/event）
+  T20 消费一次即作废（同一 request 的后续决策按 late 拒绝，第二次生成记 fallback）
+  T21 过期缓存不得阻断刷新（decision_is_fresh + on_update 丢弃 + 新 request_id）
+  T22 rename 失败保留旧 state（不删旧文件、不残留 tmp/.bak）
+  T23 rejected 回执真值表（choice/source/provider_id=null、fallback=true、applied_by=none）
+  T24 桥目录在探测后被替换（TOCTOU）→ 拒绝写入并降级
 
 运行：
   lua tests/lua_logic_test.lua
@@ -686,6 +694,148 @@ do
 end
 
 -- ============================================================
+-- T20 消费一次即作废：同一 request 的后续决策必须按 late 拒绝
+--     （回归：消费后 request 仍留在 outstanding，第二次生成又记成 llm）
+-- ============================================================
+do
+    section("T20 消费一次即作废")
+    reset_world()
+    local rid, key = begin_request()
+    local cand1 = T.S.current.candidates[1].item_id
+    local cand2 = T.S.current.candidates[2].item_id
+    publish(decision_doc(rid, key, { type = "item", item_id = cand1 }))
+    T.poll_decision()
+    local got1 = draw(0)
+    eq(got1, cand1, "第一次生成应使用决策")
+    check(T.S.outstanding[rid] == nil, "消费后该 request 必须移出在途表")
+    local consumed = T.S.consumed_requests
+    check(consumed ~= nil and consumed[rid] == true, "消费过的 request 必须被记住")
+
+    -- 同一个 request_id 再投一条新 decision（重复投递 / 生成后才到）
+    publish(decision_doc(rid, key, { type = "item", item_id = cand2 }))
+    T.poll_decision()
+    check(T.S.decision == nil, "已消费请求的后续决策不得被接受")
+    eq(T.S.rejected and T.S.rejected.reason_code, "late", "应按 late 拒绝")
+
+    draw(0)
+    local applied = read_applied()
+    eq(applied.applied_by, "fallback", "第二次生成必须是兜底，不得复用已消费请求")
+    eq(applied.source, "rule", "兜底 source 必须是 rule")
+end
+
+-- ============================================================
+-- T21 过期缓存不得阻断刷新
+--     （回归：S.decision 非空就一直压住 refresh，新请求发不出去）
+-- ============================================================
+do
+    section("T21 过期缓存恢复刷新")
+    reset_world()
+    local rid, key = begin_request()
+    publish(decision_doc(rid, key, { type = "item", item_id = T.S.current.candidates[1].item_id }))
+    T.poll_decision()
+    check(T.S.decision ~= nil, "先接受一条决策")
+    local fresh_fn = T.decision_is_fresh
+    check(fresh_fn ~= nil, "应暴露 decision_is_fresh（缓存失效判据）")
+    if fresh_fn ~= nil then
+        check(fresh_fn(T.S.decision) == true, "刚接受时应是新鲜的")
+    end
+
+    clock_ms = clock_ms + 2000                    -- 超过 validity_ms=1500
+    if fresh_fn ~= nil then
+        check(fresh_fn(T.S.decision) == false, "过期后必须判为不新鲜")
+    end
+    for _ = 1, 6 do
+        world.frame = world.frame + 1
+        M.hooks.on_update()
+    end
+    check(T.S.decision == nil, "过期缓存必须被丢弃")
+    check(T.S.current ~= nil and T.S.current.request_id ~= rid,
+        "丢弃过期缓存后必须重新发请求（新 request_id）")
+end
+
+-- ============================================================
+-- T22 rename 失败必须保留旧 state（宁可不更新，也不能丢）
+--     （回归：旧实现先 os.remove(target) 再重试，两次失败就把旧文件删了）
+-- ============================================================
+do
+    section("T22 写入失败保留旧文件")
+    reset_world()
+    begin_request()
+    local before = read_file(bpath("state.json"))
+    check(before ~= nil, "先要有一份旧 state")
+
+    local real_rename = os.rename
+    os.rename = function() return false end
+    T.request_state("room_enter", "treasure")
+    T.flush_writes()
+    os.rename = real_rename
+
+    local after = read_file(bpath("state.json"))
+    check(after ~= nil, "rename 失败后旧 state.json 必须还在")
+    eq(after, before, "rename 失败不得改写/删除旧 state.json")
+    eq(#tmp_files(), 0, "失败后不得残留 tmp 文件")
+    check(read_file(bpath("state.json.bak")) == nil, "失败后不得残留 .bak 备份")
+end
+
+-- ============================================================
+-- T23 rejected 回执真值表（协议 §5.4 行 3）
+--     （回归：rejected 时仍带 llm + fallback=false + item）
+-- ============================================================
+do
+    section("T23 rejected 回执真值表")
+    reset_world()
+    local rid, key = begin_request()
+    local cand = T.S.current.candidates[1].item_id
+    local other = T.S.current.candidates[2].item_id
+    publish(decision_doc(rid, key, { type = "item", item_id = cand }))
+    T.poll_decision()
+    draw(0)
+    world.frame = world.frame + 1
+    pickup(other)                                  -- 实际生成的不是决策道具
+
+    local applied = read_applied()
+    check(applied ~= nil, "应写出 applied.json")
+    if applied ~= nil then
+        eq(applied.phase, "rejected", "phase")
+        eq(applied.applied_by, "none", "applied_by")
+        check(applied.choice == T.JSON_NULL, "choice 必须为 null")
+        check(applied.source == T.JSON_NULL, "source 必须为 null")
+        check(applied.provider_id == T.JSON_NULL, "provider_id 必须为 null")
+        eq(applied.fallback, true, "fallback 必须为 true")
+        eq(applied.reason_code, "not_applied", "reason_code")
+    end
+end
+
+-- ============================================================
+-- T24 桥目录在校验后被替换（TOCTOU）→ 必须拒绝写入
+-- ============================================================
+do
+    section("T24 目录被替换")
+    reset_world()
+    begin_request()
+    check(read_file(bpath("state.json")) ~= nil, "先有一份 state")
+
+    -- 模拟：探测时的目录被改名，原路径上换成一个没有所有者令牌的新目录
+    local moved = BRIDGE_DIR .. "_moved"
+    sh('rmdir /s /q "' .. moved .. '" 2>nul')
+    check(os.rename(BRIDGE_DIR, moved) == true, "目录改名应成功")
+    sh('mkdir "' .. BRIDGE_DIR .. '" 2>nul')
+
+    T.request_state("room_enter", "treasure")
+    T.flush_writes()
+
+    check(read_file(bpath("state.json")) == nil, "被替换的目录里不得写出 state.json")
+    eq(T.S.profile, "none", "校验失败后应降级为 Profile none")
+    eq(T.Bridge.kind, "none", "Bridge 应停用")
+
+    -- 收尾：恢复原目录并重新探测，供后续用例使用
+    sh('rmdir /s /q "' .. BRIDGE_DIR .. '" 2>nul')
+    os.rename(moved, BRIDGE_DIR)
+    T.detect({ dir = BRIDGE_DIR })
+    eq(T.S.profile, "A", "恢复后应重新回到 Profile A")
+end
+
+-- ============================================================
 -- 汇总
 -- ============================================================
 local function cleanup()
@@ -700,10 +850,18 @@ cleanup()
 
 local total = passed + #failures
 io.write(string.format("\nlua_logic_test: %d/%d 断言通过\n", passed, total))
+local exit_code = 0
 if #failures > 0 then
     io.write("失败项：\n")
     for _, f in ipairs(failures) do io.write("  - " .. f .. "\n") end
-    os.exit(1)
+    exit_code = 1
+else
+    io.write("全部通过\n")
 end
-io.write("全部通过\n")
-os.exit(0)
+
+-- 被 Python 宿主（tests/run_lua_test.py）嵌入时不能 os.exit：那会杀掉宿主进程，
+-- 让 runner 的 subst 清理来不及执行（见 docs/lessons.md）。此时返回退出码由 runner 透传。
+if os.getenv("ISAAC_AGENT_EMBEDDED") == "1" then
+    return exit_code
+end
+os.exit(exit_code)
