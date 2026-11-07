@@ -39,7 +39,9 @@
 
 ## qa
 
-（还没有条目；抓到就加）
+| 现象 | 根因 | 怎么避 |
+| --- | --- | --- |
+| 同一台机跑几次 `tests/run_lua_test.py` 后报"没有可用盘符做 subst，无法在非 ASCII 路径下运行" | 用例末尾的 `os.exit()` 会直接结束 **Python 宿主进程**，runner 的 `finally: subst <drive>: /d` 根本来不及执行，盘符映射一直残留（G–Z 全被占满后就没有空闲盘符） | 先 `subst` 列出残留映射，逐个 `subst <drive>: /d` 清掉；根治要改 runner：清理放在映射之前（复用/回收旧映射），或让 Lua 用例返回状态而不是 `os.exit()` |
 
 ## claude / gpt（外部评审）
 

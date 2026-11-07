@@ -14,7 +14,7 @@ access from the mod.
 
 > **Status: offline-verified, not smoke-tested on a real game install.**
 > The Lua logic is covered by 74 offline assertions, the plugin by 68 offline assertions,
-> and the JSON contract by `tools/mock_e2e.py` (4 scenarios / 51 assertions). The author's
+> and the JSON contract by `tools/mock_e2e.py` (4 scenarios / 52 assertions). The author's
 > machine does not have REPENTOGON installed, so **no end-to-end run inside the actual
 > game has been performed yet**. Treat this as a working prototype, not a polished release.
 
@@ -76,6 +76,11 @@ The protocol defines three transport profiles (`docs/protocol.md` §1.4):
 
 ### Default install: local rules, no launch flags
 
+**Write ownership is one-way.** The DSH plugin is the only writer of `decision.json`; the
+mod never writes a decision. In Profile B the mod writes *nothing at all* — it only reads
+`decision.json` — and in Profile A it additionally writes `state/event/applied` for
+diagnostics. So even the fallback shape has no "mod writes a fake decision" path.
+
 With no special launch options, the Isaac Lua sandbox exposes **neither `io` nor `os`** —
 not even for reading. The mod probes this at `on_game_start` and switches to its
 **local-rule fallback**: it still picks intelligently (heal / damage / first candidate),
@@ -112,6 +117,11 @@ time out and the mod falls back to local rules with an explicit bubble.
 | Bridge | **DSH** with a configured model (any provider already usable in DSH) |
 | Plugin runtime | Node.js **>= 20** (DSH ships its own runtime; this matters only for offline tests) |
 | Python (tests only) | **>= 3.10**, plus `lupa` for the Lua test runner (`python -m pip install lupa`) |
+
+**Without REPENTOGON there is no graceful degradation.** The mod declares REPENTOGON as a
+requirement and relies on its hook installation/timing. Under the stock Repentance+ loader
+it may fail to load or register callbacks incorrectly; that configuration is unsupported.
+There is no "vanilla fallback" build — install REPENTOGON first.
 
 ---
 
@@ -155,8 +165,10 @@ Copy `plugin/` into your DSH profile as a local package (the folder name must ma
 package name `dsh-isaac-agent`):
 
 ```powershell
-$profile = "$env:USERPROFILE\.dsh\profiles\<your-profile>"
-Copy-Item -Recurse .\plugin "$profile\node_modules\dsh-isaac-agent"
+$dshProfile = "$env:USERPROFILE\.dsh\profiles\<your-profile>"
+$dest = "$dshProfile\node_modules\dsh-isaac-agent"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Copy-Item .\plugin\* $dest -Recurse -Force
 ```
 
 Then register it in that profile's `cordis.patch.yml` (merge the entry; do not replace the
@@ -248,11 +260,11 @@ logs keys or full absolute paths.
 ## Testing (offline, no game required)
 
 ```powershell
-# 1) Lua mod logic — 74 assertions, Lua 5.1/5.2/5.3/5.4 via lupa
+# 1) Lua mod logic — 74 assertions; runner supports Lua 5.1–5.4 via lupa
 python tests/run_lua_test.py
 $env:ISAAC_AGENT_LUA = "53"; python tests/run_lua_test.py   # game-like runtime
 
-# 2) end-to-end JSON contract — 4 scenarios, 51 assertions
+# 2) end-to-end JSON contract — 4 scenarios, 52 assertions
 python tools/mock_e2e.py
 ```
 
@@ -286,7 +298,7 @@ tools/mock_e2e.py      # offline mod↔plugin contract test
 
 ## Security and red lines
 
-- The mod does **not** access the network; the plugin only writes the two bridge files.
+- The mod does **not** access the network; the plugin reads `state.json` and writes only `decision.json`.
 - **No API key in the game, the mod, the bridge files, the logs, or `reason` text.** Keys
   stay in DSH's credential store.
 - The plugin accepts no model-supplied paths or code: only a `choice` and a short reason,
@@ -327,6 +339,10 @@ examples and both implementations, then run the offline tests above.
 
 ## 两种形态（安装前必读）
 
+**写入口径是单向的**：`decision.json` 只由 DSH 插件写，mod 永远不写决策。Profile B 里
+mod 什么都不写、只读 `decision.json`；Profile A 里 mod 额外写 `state/event/applied`
+用于诊断与回执。任何形态下都不存在"mod 自己编一份 decision"的路径。
+
 - **默认形态（不加任何启动项）**：以撒的 Lua 沙箱不提供 `io`/`os`，连读文件都不行。
   mod 启动探针会检测到这一点，自动走**本地规则兜底**（没红心先回血 → 没输出先补伤害 →
   否则取第一个候选），气泡明确提示 `桥接不可用（本地规则）`，并如实标成兜底。这个形态
@@ -340,6 +356,10 @@ examples and both implementations, then run the offline tests above.
 协议里的 Profile B（插件写、mod 只读）是设计上的"不写盘"形态，但读文件同样需要文件
 访问能力；在原生沙箱里没有这个能力，所以本版把"没有文件能力"直接当作本地规则处理，
 不假装 agent 可用。Profile C（SaveData 中继）只做研究，默认关闭，本版未实现。
+
+**没装 REPENTOGON 会怎样**：mod 把 REPENTOGON 声明为硬依赖（回调注册/时序都依赖它）。
+在原生 Repentance+ 加载器下它可能加载失败或钩子行为不对；这种配置不受支持，也没有
+"纯原版"降级版。请先装 REPENTOGON 再启用 mod。
 
 ## 安装（三步）
 
@@ -358,7 +378,7 @@ examples and both implementations, then run the offline tests above.
 
 ```powershell
 python tests/run_lua_test.py     # Lua 逻辑 74 条断言
-python tools/mock_e2e.py         # 四种场景的 mock 联调，51 条断言
+python tools/mock_e2e.py         # 四种场景的 mock 联调，52 条断言
 ```
 
 ## 现实边界（如实说明）
@@ -378,3 +398,5 @@ python tools/mock_e2e.py         # 四种场景的 mock 联调，51 条断言
 ## 许可
 
 [MIT](LICENSE)。
+
+
