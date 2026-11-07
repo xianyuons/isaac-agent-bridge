@@ -37,6 +37,10 @@ tests/lua_logic_test.lua — isaac_agent 离线逻辑测试
   T31 session 不一致的 decision 拒收（session_mismatch），回执不得记 applied
   T32 换局后旧 decision 拒收（on_game_end→进层 / startSeed 变化 两条路径）
   T33 event / applied 落盘必须带 session_id
+  T34 安全跳过（player_dead）的 error_code 必须为 null（and/or 三元陷阱回归）
+  T35 候选签名覆盖全部候选（第 9 项变化 → key 必变）
+  T36 未知 error_code 拒收（VALIDATION/invalid_type）
+  T37 JSON 解码拒绝字符串内未转义控制字符（RFC 8259）
 
 运行：
   lua tests/lua_logic_test.lua
@@ -1121,6 +1125,91 @@ do
     if applied ~= nil then
         eq(applied.session_id, T.S.session_id, "applied.session_id 应等于当前会话")
     end
+end
+
+-- ============================================================
+-- T34 安全跳过（player_dead）的 applied.error_code 必须是 null
+--     （回归：`guard_skip and nil or err_code` 是 Lua and/or 三元陷阱，恒返回 TIMEOUT）
+-- ============================================================
+do
+    section("T34 安全跳过不写 TIMEOUT")
+    reset_world()
+    player.dead = true
+    begin_request()
+    local got = draw(0)
+    check(got == nil, "角色已死亡时应 skip（返回 nil）")
+    local applied = read_applied()
+    check(applied ~= nil, "安全跳过也要写回执")
+    if applied ~= nil then
+        check(applied.error_code == T.JSON_NULL, "安全跳过的 error_code 必须是 null")
+        eq(applied.reason_code, "player_dead", "reason_code")
+        eq(applied.applied_by, "fallback", "applied_by")
+        eq(applied.phase, "applied", "phase")
+    end
+    player.dead = false
+end
+
+-- ============================================================
+-- T35 候选签名覆盖全部候选（不只是前 8 项）
+-- ============================================================
+do
+    section("T35 指纹覆盖全部候选")
+    reset_world()
+    local function cand_list(n, mutate_at, mutate_to)
+        local list = {}
+        for i = 1, n do list[i] = { item_id = i } end
+        if mutate_at ~= nil then list[mutate_at] = { item_id = mutate_to } end
+        return list
+    end
+    local base = cand_list(12)
+    local key1 = T.make_key("treasure", base)
+    local changed9 = cand_list(12, 9, 999)
+    local key9 = T.make_key("treasure", changed9)
+    check(key1 ~= key9, "第 9 项变化时 gen_level_key 必须变化（旧实现只取前 8 项，键不变）")
+    local same = cand_list(12)
+    eq(T.make_key("treasure", same), key1, "候选未变时 key 必须稳定")
+end
+
+-- ============================================================
+-- T36 未知 error_code（五类之外）必须拒收
+-- ============================================================
+do
+    section("T36 未知 error_code 拒收")
+    reset_world()
+    local rid, key = begin_request()
+    local cand = T.S.current.candidates[1].item_id
+    local doc = decision_doc(rid, key, { type = "item", item_id = cand }, {
+        error_code = "ALIEN",                 -- 不在 IO/TIMEOUT/VALIDATION/MODEL/INTERNAL 里
+        decision = {
+            choice = { type = "item", item_id = cand },
+            reason = "外部码",
+            confidence = 1.0,
+            fallback = true,
+            source = "rule",
+            provider_id = "rule:fallback",
+            reason_code = "internal_error",
+        },
+    })
+    publish(doc)
+    T.poll_decision()
+    check(T.S.decision == nil, "未知 error_code 的决策不得被接受")
+    eq(T.S.rejected and T.S.rejected.reason_code, "invalid_type", "应按 VALIDATION/invalid_type 拒收")
+end
+
+-- ============================================================
+-- T37 JSON 解码必须拒绝字符串内未转义的控制字符（RFC 8259）
+-- ============================================================
+do
+    section("T37 JSON 严格拒绝控制字符")
+    reset_world()
+    local bad_nl = '{"a":"line1' .. string.char(10) .. 'line2"}'
+    local doc1 = T.decode(bad_nl)
+    check(doc1 == nil, "字符串内未转义换行必须拒绝")
+    local bad_tab = '{"a":"x' .. string.char(9) .. 'y"}'
+    check(T.decode(bad_tab) == nil, "字符串内未转义制表符必须拒绝")
+    local good = '{"a":"line1\\nline2"}'
+    local okdoc = T.decode(good)
+    check(okdoc ~= nil and okdoc.a == "line1\nline2", "转义换行仍应正常解析")
 end
 
 -- ============================================================

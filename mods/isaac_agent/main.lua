@@ -394,6 +394,10 @@ do
                         fail("bad escape")
                     end
                 else
+                    -- RFC 8259：字符串里不允许未转义的控制字符（U+0000–U+001F）。
+                    -- 宽松解析会让坏 JSON 悄悄通过，和“严格 JSON”的契约自相矛盾。
+                    local b = c:byte()
+                    if b ~= nil and b < 0x20 then fail("control char in string") end
                     out[#out + 1] = c
                     pos = pos + 1
                 end
@@ -1264,7 +1268,9 @@ end
 -- 每次生成消费一条决策（协议 §6.7.5），第二个底座需要新决策或走本地规则。
 local function make_gen_level_key(pool_name, candidates)
     local sig = hash_num(pool_name .. "|" .. tostring(#candidates) .. "|" .. tostring(S.level.stage_seed))
-    for i = 1, math.min(#candidates, 8) do
+    -- 全部候选参与签名（协议 §1.5：候选池内容签名，候选池重掷必须变化）。
+    -- 早先只取前 8 项，第 9 项之后的变化检测不到；候选上限 64，代价可忽略。
+    for i = 1, #candidates do
         sig = (sig * 31 + candidates[i].item_id) % 4294967296
     end
     return string.format("f%d:r%d:%s:p-1:%s",
@@ -1414,6 +1420,12 @@ end
 -- ============================================================
 -- 决策校验（协议 §3.3、§3.5、§7）
 -- ============================================================
+-- 协议 §3.1：error_code 是**封闭五值枚举**（外加 null）。未知值必须拒收，
+-- 否则两端判定分叉（插件 index.js 用 ERROR_CODES.has() 校验，mod 却放行）。
+local KNOWN_ERROR_CODES = {
+    IO = true, TIMEOUT = true, VALIDATION = true, MODEL = true, INTERNAL = true,
+}
+
 local KNOWN_FEATURES = {
     ["transport:file_write"] = true,
     ["hook:pre_get_collectible"] = true,
@@ -1482,6 +1494,10 @@ local function validate_decision(doc, ctx)
     local err = doc.error_code
     if err ~= JSON_NULL and err ~= nil then
         if type(err) ~= "string" then return false, "VALIDATION", "invalid_type" end
+        if not KNOWN_ERROR_CODES[err] then
+            -- 未知码：按 VALIDATION/invalid_type 拒收（与插件侧 ERROR_CODES.has() 对齐）
+            return false, "VALIDATION", "invalid_type"
+        end
     else
         err = nil
     end
@@ -2048,6 +2064,19 @@ local function make_applied_local(rule, gen_key, pedestal_index, reason_code_ove
         rsn_code = S.rejected.reason_code or rsn_code
     end
 
+    -- 显式 if/else：Lua 里 `cond and nil or other` 永远走 other（nil 被当假值）。
+    -- 之前这里写成 `guard_skip and nil or err_code`，导致安全跳过（no_candidate/player_dead）
+    -- 的 error_code 被写成 TIMEOUT，回执真值表（协议 §5.4 行 4）对不上。
+    local wire_error_code, wire_reason_code
+    if guard_skip then
+        wire_error_code = nil                 -- 安全跳过：error_code 为 null
+        wire_reason_code = rule.reason_code
+    else
+        wire_error_code = err_code
+        wire_reason_code = rsn_code
+    end
+    if reason_code_override ~= nil then wire_reason_code = reason_code_override end
+
     local rec = {
         request_id = S.last_request_id,
         gen_level_key = gen_key,
@@ -2061,8 +2090,8 @@ local function make_applied_local(rule, gen_key, pedestal_index, reason_code_ove
         phase = "applied",
         choice = rule.choice,
         reason = reason,
-        error_code = guard_skip and nil or err_code,
-        reason_code = reason_code_override or (guard_skip and rule.reason_code or rsn_code),
+        error_code = wire_error_code,
+        reason_code = wire_reason_code,
         pedestal_index = pedestal_index,
         latency_ms = nil,
         actual_item_id = nil,
