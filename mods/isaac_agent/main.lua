@@ -8,24 +8,27 @@ isaac_agent — 游戏侧 Lua mod（依赖 REPENTOGON / Repentance+）
   4. 事后核验 + 本地兜底：POST_PICKUP_INIT 比较实际生成的底座 id，核验后弹气泡；
      没有新鲜决策时走 §6.5 的本地规则 v1（缺红心→heal，缺输出→damage）。
 
-协议：docs/protocol.md（1.0-draft.3）。红线（协议 §9）：
+协议：docs/protocol.md（1.0-draft.4/5；字段口径按 draft.4：只有 features，没有 capabilities）。红线（协议 §9）：
   · 不联网、不读 key、不写注册表、不执行远端代码；
   · 不在游戏回调里做磁盘 I/O / 阻塞等待（1500ms 是决策有效期，不是等待时长）；
   · 只通过官方 API 改变道具生成，不做帧级输入操作。
 
-传输（协议 §1.4 / §1.8 三种 Profile，启动探针判定）：
-  · Profile A（目标）：Lua 侧有 io + os.rename → 原子写 state/event/applied，读 decision；
-  · Profile B / none（保底）：没有文件能力 → 只跑本地规则，气泡明确写“桥接不可用”。
-  ⚠ 实测约束：原版 REPENTOGON 沙箱不提供 io/os（参考实现亦只在 Mod:SaveData 上搭桥），
-    因此 Profile A 目前需要 `--luadebug` 启动项，或等 REPENTOGON 暴露文件 API。
+传输（协议 §1.4 / §1.8，启动探针判定）：
+  · Profile A（当前唯一可实现形态）：Lua 侧有 io + os.rename → 原子写 state/event/applied，
+    读 decision；需要 `--luadebug`（它会放开所有 mod 的文件权限）。
+  · Profile B（未实现）：draft.5 想让它做“mod 只读 decision.json”，但那同样需要读文件 API，
+    vanilla 沙箱没有；见 docs/reference-notes.md §9（结论：v1 只支持 A，否则纯本地规则）。
+  · Profile none（现状保底）：没有文件能力 → 只跑本地规则，气泡明确写“桥接不可用”。
+  ⚠ 实测约束：原版 REPENTOGON 沙箱不提供 io/os（参考实现亦只在 Mod:SaveData 上搭桥）。
     桥目录由插件侧创建（mod 只探测、不调 shell、不建目录）。
     桥目录里的 `.isaac_agent_owner` 是 mod 的所有者令牌：每次写入前后都会校验它，
     插件侧 **不得删除或改写** 这个文件（否则 mod 会判定目录被替换并停止写入）。
     探针失败 **不会** 让游戏坏掉：退回本地规则，并在气泡/日志里说明。
   ⚠ Profile C（SaveData 中继）按协议 §1.4 属研究形态、默认关闭，本版不实现。
 
-时间：所有超时判定用 Isaac.GetTime() 的单调毫秒；没有 os.time 时 ts 用单调值并
-     附 `x_clock: "monotonic"`（协议 §1.7 扩展字段），插件据此改用接收时刻。
+时间：超时判定一律用 Isaac.GetTime() 的单调毫秒。对外 `ts` 用“墙钟锚点 + 单调增量”：
+     观察到 os.time() 秒跳变时记锚点，之后 ts 精确到毫秒（x_clock="epoch"）；
+     尚未对齐时为秒级（x_clock="epoch_second"）；没有 os 时用单调值（x_clock="monotonic"）。
 ============================================================================ ]]
 
 local MOD_NAME = "isaac_agent"
@@ -107,6 +110,12 @@ local ROOM_TO_POOL = {
 -- ============================================================
 -- 基础工具
 -- ============================================================
+-- 墙钟锚点（评审 M2）：os.time() 只有秒精度，直接 *1000 当 ts 会丢掉亚秒信息，
+-- 让插件的 validity 预算最多差 1 秒。这里在观察到 os.time() 秒跳变的那一刻
+-- （≤1 帧误差）记录 (epoch_base, mono_base)，之后 ts = base + 单调增量，精确到毫秒。
+-- 注意：必须声明在 now_ms/wall_ms 之前，否则它们捕获不到这个 local（会变成 nil）。
+local CLOCK = { last_os = nil, epoch_base = nil, mono_base = nil, synced = false }
+
 local function clamp_int(v, lo, hi, default)
     if type(v) ~= "number" or v ~= v then return default end
     v = math.floor(v)
@@ -125,16 +134,43 @@ local function now_ms()
 end
 
 -- 墙钟毫秒：只有 --luadebug（os 可用）时才有；否则返回 nil。
+-- 已同步时返回毫秒精度的 epoch 值（见 CLOCK 注释）；未同步时退回秒级 os.time()。
 local function wall_ms()
-    local ok, t = pcall(function() return os.time() end)
+    if CLOCK.synced and CLOCK.epoch_base ~= nil and CLOCK.mono_base ~= nil then
+        return CLOCK.epoch_base + (now_ms() - CLOCK.mono_base)
+    end
+    if type(os) ~= "table" or type(os.time) ~= "function" then return nil end
+    local ok, t = pcall(os.time)
     if ok and type(t) == "number" and t > 0 then return t * 1000 end
     return nil
 end
 
+-- 每次 update 调一次：观测 os.time() 的秒跳变，把墙钟与单调钟对齐。
+-- 跳变发生在本帧与上一帧之间，所以锚点误差 ≤ 一帧（30fps≈33ms），远小于
+-- 插件 200ms 的落盘余量。
+local function tick_wall_clock()
+    if type(os) ~= "table" or type(os.time) ~= "function" then return end
+    local ok, sec = pcall(os.time)
+    if not ok or type(sec) ~= "number" or sec <= 0 then return end
+    if CLOCK.last_os == nil then
+        CLOCK.last_os = sec
+        return
+    end
+    if sec ~= CLOCK.last_os then
+        CLOCK.last_os = sec
+        CLOCK.epoch_base = sec * 1000
+        CLOCK.mono_base = now_ms()
+        CLOCK.synced = true
+    end
+end
+
 -- 协议 ts 字段：优先墙钟；没有墙钟就用单调值，并靠 x_clock 标注（协议 §1.7）。
+-- x_clock 取值：epoch（毫秒精度）/ epoch_second（尚未对齐，秒级）/ monotonic（无 os）。
 local function doc_ts()
     local w = wall_ms()
-    if w ~= nil then return w, "epoch" end
+    if w ~= nil then
+        return w, (CLOCK.synced and "epoch" or "epoch_second")
+    end
     return now_ms(), "monotonic"
 end
 
@@ -1179,7 +1215,10 @@ local function make_gen_level_key(pool_name, candidates)
         S.level.floor, S.level.grid, pool_name, hex8(sig))
 end
 
-local function capabilities_list()
+-- 本端能力列表 → 只写进 `features`。
+-- 契约 1.0-draft.4 已删除 `capabilities` 字段、统一为 `features`（tri-party A29）；
+-- 写两份必然分叉，所以这里只产出一份。
+local function features_list()
     local caps = { "hook:pre_get_collectible", "apply:prefetch" }
     if Bridge.kind == "file" then caps[#caps + 1] = "transport:file_write" end
     return arr(caps)
@@ -1229,9 +1268,8 @@ local function build_state_doc(request_id, gen_key, trigger_type, pool_name, can
         validity_ms = validity,
         error_code = JSON_NULL,
         reason_code = JSON_NULL,
-        features = capabilities_list(),
+        features = features_list(),
         requires = arr({}),
-        capabilities = capabilities_list(),
         trigger = {
             type = trigger_type,
             event_seq = S.event_seq or 0,
@@ -1319,7 +1357,7 @@ end
 -- ============================================================
 -- 决策校验（协议 §3.3、§3.5、§7）
 -- ============================================================
-local KNOWN_CAPABILITIES = {
+local KNOWN_FEATURES = {
     ["transport:file_write"] = true,
     ["hook:pre_get_collectible"] = true,
     ["apply:prefetch"] = true,
@@ -1367,7 +1405,7 @@ local function validate_decision(doc, ctx)
     if doc.requires ~= nil and doc.requires ~= JSON_NULL then
         if type(doc.requires) ~= "table" then return false, "VALIDATION", "invalid_type" end
         for _, need in ipairs(doc.requires) do
-            if KNOWN_CAPABILITIES[need] ~= true then
+            if KNOWN_FEATURES[need] ~= true then
                 return false, "VALIDATION", "version_minor_feature"
             end
         end
@@ -2085,6 +2123,7 @@ local function on_game_start()
     S.seen_decisions, S.seen_order = {}, {}
     S.consumed_requests, S.consumed_n = {}, 0
     S.event_seq = 0
+    CLOCK.last_os, CLOCK.epoch_base, CLOCK.mono_base, CLOCK.synced = nil, nil, nil, false
 
     bridge_detect()
     load_tags()
@@ -2234,6 +2273,10 @@ local function on_pickup_init(_, pickup)
 end
 
 local function on_update()
+    -- 墙钟对齐（评审 M2）：os.time() 秒跳变时记锚点，让 ts 具备毫秒精度。
+    -- 每帧一次 os.time 调用，成本可忽略。
+    tick_wall_clock()
+
     -- 回调期间排队的文档每帧落盘（无排队时是 3 次 nil 判断）
     flush_writes()
 
@@ -2351,9 +2394,12 @@ return {
     _test = {
         S = S,
         Bridge = Bridge,
+        CLOCK = CLOCK,
         JSON_NULL = JSON_NULL,
         arr = arr,
         detect = bridge_detect,
+        tick_wall_clock = tick_wall_clock,
+        doc_ts = doc_ts,
         request_state = request_state,
         poll_decision = poll_decision,
         validate_decision = validate_decision,
@@ -2380,6 +2426,7 @@ return {
             S.cand_cache = {}
             S.items_cache = nil
             Pending.state, Pending.event, Pending.applied = nil, nil, nil
+            CLOCK.last_os, CLOCK.epoch_base, CLOCK.mono_base, CLOCK.synced = nil, nil, nil, false
         end,
     },
 }

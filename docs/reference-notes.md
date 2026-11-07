@@ -216,3 +216,15 @@
 | 控制台命令 | 4138-4565 |
 | 换层 `enterLevel` / `onNewLevel` / `onNewRoom` / `onGameEnd` | 4576-4768 |
 | 注册与启动日志 | 4770-4805 |
+
+---
+
+## 9. Profile B 可行性判断（t21，回应评审 M7）
+
+**结论：v1 不应承诺 Profile B。** Lua 侧缺的不是“少写点”，而是**一个读文件的 API**；mod 加载方式不用改（mod 本身加载正常）。
+
+1. **读 API 不存在**：vanilla Isaac 的 Lua 沙箱不提供 `io` / `os`（IsaacDocs《Standard-Library》明确二者只在 `--luadebug` 下可用）。Profile B 的核心动作是“打开 `<bridge>/decision.json` 读”，没有 `io.open` 连只读都做不到——所以 B 在当前运行时**不可能**实现。
+2. **REPENTOGON 没有替代口**：参考实现（AI Item Control，REPENTOGON 1.0.12e）实测后也只找到 `Mod:SaveData` / `Mod:LoadData`（读写**自己**的存档数据文件），没有任何“按任意路径读文件”的 API；而 `--luadebug` 一旦开启，`io` + `os` 全部可用 → 形态直接变成 Profile A，不是 B。
+3. **要真 B，只有两条路**：(a) 上游 REPENTOGON 增加“只读文件”能力（需上游排期 + 契约先行）；(b) 走共享 SaveData 中继（协议里的 Profile C）：插件直接写 mod 的存档数据文件、mod 用 `Mod:LoadData` 读——但插件要先知道该文件路径，且要与 mod 的写入互斥（跨进程只能靠存档目录约定 + 我们的 epoch/owner 令牌），属“能做但不该在 v1 做”。
+
+**因此 v1 的口径应是**：`A`（需 `--luadebug`，会放开所有 mod 的文件权限）/ `none`（纯本地规则）二选一；文档里把 B 标成“未实现，需上游 API”，不要写成默认形态。
