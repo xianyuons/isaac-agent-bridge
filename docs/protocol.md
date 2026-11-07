@@ -1,8 +1,8 @@
-# 桥接协议 v1.0（state / decision / event / applied）
+# 桥接协议 v1.1-draft.1（wire 1.0；state / decision / event / applied）
 
 > 状态：草案（draft）。实现方：Lua mod（REPENTOGON）与 DSH 插件（TypeScript）。
-> 文档版本：`1.0-draft.5`（2026-11-07，t8 Claude 补审 + captain 产品取舍回写）。协议版本字段仍为 `1.0`；版本历史见 §12。
-> 负责人：contract。配套文档：[架构](architecture.md)、[代码规范](standards.md)。
+> 文档版本：`1.1-draft.1`（2026-11-07，t24 M5/M7 决策回写；wire 字段仍为 `1.0`）。版本历史见 §12。
+> 负责人：contract。配套文档：[架构](architecture.md)、[代码规范](standards.md)、[M5/M7 决策](reviews/decisions-m5-m7.md)。
 > 关键词：**必须**（MUST）、**不得**（MUST NOT）、**应该**（SHOULD）、**可以**（MAY）。
 
 ---
@@ -15,7 +15,7 @@
 4. **失败必须显式**：任何失败都归到五类错误码之一（`IO` / `TIMEOUT` / `VALIDATION` / `MODEL` / `INTERNAL`），并同时给出更细的 `reason_code`；没有“静默默认”。
 5. **“这次是 agent 还是兜底”只看一个字段**：`applied.json.applied_by`（`llm` / `provider` / `fallback` / `none`），不靠理由是否为空反推。
 6. **对端比我新时必须保守**：major 不匹配且没有兼容 codec → 拒绝解析并走本地兜底；有兼容 codec 则按 §7.3 降级；minor 更新 → 忽略未知字段，只有出现在 `requires` 里的未知能力才拒绝。
-7. **默认 Profile B，A 可选，C 推迟到 v1.1+。** 默认不要求玩家改启动项：mod 只读 `decision.json`，桥目录写入全在插件；代价是没有实时 state、实时 agent 不可用。实时 agent 需要 `--luadebug` 启用 Profile A——这会 **给所有 mod 放开文件访问**，不是单 mod 开关。SaveData 中继（Profile C）v1 不做。见 §1.4。
+7. **v1 只支持 Profile A 的实时桥；无桥接 = local-only，不叫 Profile B。** v1 没有实现“mod 只读 decision、不写 state”的 B；没有 `--luadebug`（或 REPENTOGON 文件 API）时，mod 不写任何桥文件、不读 decision，回调只跑本地规则并明确提示“桥接不可用”。实时 agent 必须启用 Profile A——这会 **给所有 mod 放开文件访问**，不是单 mod 开关。Profile B / C 推迟到 v1.1+。见 §1.4。
 
 ### 0.1 命名对照
 
@@ -36,21 +36,21 @@
 - 两维分开，才能保住“每次抽取恰好落一个分类”的不变量；否则每加一个 provider 就要动 `source` 枚举，历史 `applied.json` 的统计口径全部作废。
 - **误用警告**：实现方 **不得** 用 `provider_id` 判断“是否兜底”。兜底只看 `fallback` / `applied_by`；`provider_id` 只做来源标注与展示。
 
-### 0.2 English Summary (protocol v1.0-draft.5)
+### 0.2 English Summary (protocol v1.1-draft.1, wire 1.0)
 
 This document defines the local file bridge between a REPENTOGON Lua mod (game side) and a
 DSH plugin (agent side) for *The Binding of Isaac: Repentance+*. The game only describes
 its situation; the agent only chooses from the game's candidate pool. Neither side may
 invent state or bypass the contract.
 
-**Profiles.** The default is **Profile B**: the plugin is the only writer, the mod never
-writes `state/event/applied` and only consumes `decision.json`. There is no live state
-export, so Profile B cannot run a real-time agent — it uses preset decisions or the local
-rule, and must say so instead of pretending the agent is available. **Profile A** is
-optional and requires launching the game with `--luadebug`, which grants filesystem access
-to *every* installed mod (a real, global risk, not a per-mod switch); only A exports state
-and can run the agent live. **Profile C** (SaveData relay) is deferred to v1.1+ and must
-not be claimed or used as a default.
+**Profiles.** **v1 supports Profile A only** for the live bridge: the mod needs file I/O
+(`--luadebug` or a REPENTOGON file API), exports `state/event/applied`, and consumes
+`decision.json`. Without that capability the mod runs **local-only**: it writes no bridge
+files, does not read decisions, and says "bridge unavailable" instead of pretending.
+**Profile B** (mod reads preset decisions, writes no state) is **not implemented in v1**;
+it is deferred to v1.1+ pending a stable read API. **Profile C** (SaveData relay) is also
+v1.1+ and must not be claimed. `--luadebug` grants filesystem access to *every* installed
+mod (a real, global risk, not a per-mod switch).
 
 **Documents and keys.** UTF-8, BOM-less, strict-JSON files live in one bridge directory
 (default `%LOCALAPPDATA%\IsaacAgent`): `state.json` (mod → plugin, Profile A only),
@@ -103,8 +103,8 @@ callback 62.
 
 **Out of scope in v1.** No decision queue (one active generation target, latest-wins), no
 complete audit log (`applied.json` is the last receipt), no reliable event bus (file events
-may be lost), no live agent in the default Profile B (no state export), and no map/enemy
-export. See §11 for the full list of known trade-offs and §10 for byte-stable examples.
+may be lost), no live agent without Profile A, and no map/enemy export. See §11 for the
+full list of known trade-offs and §10 for byte-stable examples.
 
 ---
 
@@ -124,17 +124,17 @@ export. See §11 for the full list of known trade-offs and §10 for byte-stable 
 
 ```
 %LOCALAPPDATA%\IsaacAgent\
-├─ state.json      # Profile A: mod 写；Profile B: 不存在（不导出）
-├─ event.json      # Profile A: mod 写；Profile B: 不存在
-├─ applied.json    # Profile A: mod 写；Profile B: 不存在
-├─ decision.json   # 插件写，mod 读（所有 Profile）
+├─ state.json      # Profile A: mod 写；local-only: 不存在
+├─ event.json      # Profile A: mod 写；local-only: 不存在
+├─ applied.json    # Profile A: mod 写；local-only: 不存在
+├─ decision.json   # 插件写，mod 读（v1 只有 A 读）
 ├─ plugin_status.json # 插件写，mod/QA 读（可选诊断，见 §1.11）
 └─ bridge.lock     # 插件实例锁（插件写，防多写者，见 §1.10）
 ```
 
 - 文件集合 **不得** 由模型或远端输入决定；路径 **不得** 接受模型输出。
 - 测试与离线模拟 **可以** 用环境变量覆盖桥目录（`ISAAC_AGENT_DIR`），但插件 **必须** 校验：绝对路径、规范化后仍位于白名单根内、父目录 realpath 在白名单内、不是符号链接/junction 指向别处。校验失败 → `VALIDATION` / `io_error`，拒绝读写。
-- `<bridge>` 由 **插件** 创建（Profile B 默认也由插件写）；mod 只在 Profile A 的写探针时尝试创建/写入。mod 不得假设目录可写。
+- `<bridge>` 由 **插件** 创建；mod 只在 Profile A 的写探针时尝试创建/写入。mod 不得假设目录可写。
 
 ### 1.3 原子写
 
@@ -147,40 +147,41 @@ export. See §11 for the full list of known trade-offs and §10 for byte-stable 
 
 读者 **必须** 把“目标文件短暂不存在”当作可重试状态，而不是空状态：先重试（指数退避 ≤ 200ms），超过窗口仍无文件才按缺失处理。读者 **不得** 读取 `*.tmp.*`。
 
-### 1.4 谁写谁读（默认 B；A 可选；C 推迟到 v1.1+）
+### 1.4 谁写谁读（v1 只支持 A；无桥接 = local-only；B/C v1.1+）
 
-> **硬约束：任何实现都不得假设 mod 能写盘。** 下面的“写者”是条件式的；只有 Profile A 才由 mod 写 `state/event/applied`。Profile B 没有这三份文件，Profile C 在 v1 不实现。
+> **硬约束：任何实现都不得假设 mod 能写盘。** 下面的“写者”是条件式的；v1 只有 Profile A 才由 mod 写 `state/event/applied`。无桥接时 mod 不写这三份文件；Profile B / C 在 v1 **未实现**。
 
 “内容作者”与“文件写者”分开定义：`state/event/applied` 的内容 **只能由 mod 生成**；中继形态下可以由插件侧进程落盘，但 **不得** 增删改内容。
 
-| 文件 | 内容作者 | Profile B（默认）写者 | Profile A（可选）写者 | Profile C（v1.1+）写者 |
+| 文件 | 内容作者 | Profile A（**v1 唯一桥接**）写者 | Profile B（v1.1+）写者 | Profile C（v1.1+）写者 |
 | --- | --- | --- | --- | --- |
-| `state.json` | mod | —（不导出） | mod | 插件侧 feeder（逐字节中继） |
-| `event.json` | mod | — | mod | 插件侧 feeder |
-| `applied.json` | mod | — | mod | 插件侧 feeder |
-| `decision.json` | 插件 | **插件** | 插件 | 插件（v1.1+） |
+| `state.json` | mod | mod | —（不导出） | 插件侧 feeder（逐字节中继） |
+| `event.json` | mod | mod | — | 插件侧 feeder |
+| `applied.json` | mod | mod | — | 插件侧 feeder |
+| `decision.json` | 插件 | 插件 | 插件 | 插件 |
 | `plugin_status.json` | 插件 | 插件 | 插件 | 插件 |
 | `bridge.lock` | 插件 | 插件 | 插件 | 插件 |
 
-**Profile B — 单向只读（默认，产品形态）**
-- 玩家 **不需要改启动项**；mod 只读 `decision.json`，桥目录所有写入由插件完成。
-- **没有实时 state 导出**，所以实时 agent 不可用；只能：
-  - 使用 **预置策略**（用户在 DSH 侧预先算好/写好决策），或
-  - 纯本地规则（`source: "rule"`，气泡提示“桥接不可用”，`error_code: "IO"` / `bridge_unavailable`），或
-  - 由外部把完整 StateDoc 交给插件（不是从游戏内实时导出）。
-- Profile B **不得** 假装 agent 可用，也 **不得** 无限等待；生成时没有决策就本地兜底。
-
-**Profile A — 双向文件桥（可选，高风险）**
-- 前提：玩家以 **`--luadebug`** 启动，让 mod 能读写 `<bridge>`；启动探针通过后才启用（见 §1.8）。
+**Profile A — 双向文件桥（v1 唯一能实时跑 agent 的形态）**
+- 前提：玩家以 **`--luadebug`** 启动（或 REPENTOGON 暴露文件 API），让 mod 能读写 `<bridge>`；启动探针通过后才启用（见 §1.8）。
 - **这不是“给本 mod 开一个开关”**：`--luadebug` 会 **给所有 mod 放开文件访问**；必须原样告知玩家，不能包装成普通功能开关。
-- 只有 A 才由 mod 写 `state/event/applied`；这是唯一能实时跑 agent 的形态。
+- 只有 A 才由 mod 写 `state/event/applied`。
 
-**Profile C — SaveData 中继（推迟到 v1.1+，v1 不做）**
-- 不在 v1 实现。把协议塞进 `Mod:SaveData` 会遇到数据类型受限、与存档写入/回滚机制冲突、审计困难；v1.1+ 再评估。
-- 若未来实现：mod 把文档内容写进存档数据，插件侧 feeder 读取并原子落盘；feeder 缺失/存档不可读时等同 B。
+**无桥接（local-only，不是 Profile B）**
+- 没有 `--luadebug` / 沙箱无 `io` / 探针失败时，mod **不写任何桥文件、不读 `decision.json`**；回调 62 只跑本地规则，气泡提示“桥接不可用（本地规则）”。
+- 这 **不是** Profile B：v1 没有实现“mod 只读 decision 消费预置决策”的路径；不得把 local-only 说成默认 B，也不得暗示预置决策可用。
+- 失败可见性：气泡 + `Isaac.DebugString` + 插件 `plugin_status.json`（若插件在线）。
+
+**Profile B — 单向只读（v1.1+，未实现）**
+- 定义：mod 只读 `decision.json`、不写 `state/event/applied`；可从预置决策/Dsh 侧消费，但 **不能实时问模型**（没有 state 导出）。
+- 前提：需要稳定的只读文件 API（t21 待证）；v1 不实现，**不得** 作为默认或保底路径。
+
+**Profile C — SaveData 中继（v1.1+，未实现）**
+- 把协议塞进 `Mod:SaveData` 会遇到数据类型受限、与存档写入/回滚机制冲突、审计困难；v1.1+ 再评估。
+- 若未来实现：mod 把文档内容写进存档数据，插件侧 feeder 读取并原子落盘；feeder 缺失/存档不可读时等同 local-only。
 - v1 的文档/实现都 **不得** 声称支持 C，也不得把 C 作为默认或保底路径。
 
-> 共同不变量：**`decision.json` 是唯一必需的方向**；mod 永远不阻塞；Profile A 的失败显式落 `applied.json`，Profile B 用气泡 + `Isaac.DebugString` + 插件 `plugin_status.json`（见 §1.9/§1.11）。
+> 共同不变量：**`decision.json` 是唯一必需的方向**；mod 永远不阻塞；Profile A 的失败显式落 `applied.json`，local-only 用气泡 + `Isaac.DebugString` + 插件 `plugin_status.json`（见 §1.9/§1.11）。
 
 ### 1.5 身份、时间与有效期
 
@@ -220,26 +221,26 @@ export. See §11 for the full list of known trade-offs and §10 for byte-stable 
 
 ### 1.8 启动能力探针（Profile 判定）
 
-**默认目标是 Profile B，不是 A。** mod 在 `on_game_start` 做一次只读探测；只有在玩家已用 `--luadebug` 启动时，写探针才可能成功：
+**v1 只有 Profile A 或 local-only，没有 Profile B。** mod 在 `on_game_start` 做一次探测；只有在玩家已用 `--luadebug`（或 REPENTOGON 文件 API）时，写探针才可能成功：
 
-1. 尝试读 `decision.json`（不存在视为“待创建”）；读不到 → 无桥接，纯本地规则。
+1. 尝试读 `decision.json`（不存在视为“待创建”）。
 2. 尝试创建 `<bridge>` 并写 `<bridge>\.probe.tmp`，关闭，重命名为 `.probe`，读回比对，最后删除。
-3. 写探针失败是 **Profile B 的预期路径**，不记致命错误；仅记录 `transport:file_write=false`，继续以 B 运行。
+3. 写探针失败 → **local-only**（不是 B）：仅记录 `transport:file_write=false`，不进入桥接路径；不记致命错误。
 4. 写 + 读都通过 → **Profile A**（说明启动项已放开文件权限）；结果随 `state.features` 上报。
 5. 映射：
-   - 读写都通过 → **Profile A**（可选、高风险）；
-   - 只有读通过 → **Profile B**（默认；本地规则/预置策略；实时 agent 不可用）；
-   - 读也不通过 → 无桥接，纯本地规则，气泡明确提示。
+   - 读写都通过 → **Profile A**（v1 唯一桥接，高风险/显式 opt-in）；
+   - 只有读通过 → **仍然是 local-only**：v1 不实现 B 的消费逻辑，不得因为“能读”就声称 B 可用；
+   - 读也不通过 → local-only，气泡明确提示“桥接不可用（本地规则）”。
 
 探针 **不得** 在帧回调中执行，只在启动/读档完成后一次；**不得** 主动提示/诱导玩家开 `--luadebug`，只能在其已开启时识别 A。
 
-### 1.9 Profile B 的失败上报
+### 1.9 local-only 的失败上报
 
-Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
+无桥接时 mod 写不了 `applied.json`，失败必须仍可见：
 
 - 屏幕气泡显示 `[本地规则] <reason>`；
 - 游戏日志 `Isaac.DebugString` 输出一行结构化日志（含 `request_id`（若有）、`error_code`、`reason_code`）；
-- 插件 **应该** 在 `plugin_status.json` 标记 `degraded` 并给出原因（B 下 mod 不写盘，但插件可写）；
+- 插件 **应该** 在 `plugin_status.json` 标记 `degraded` 并给出原因（插件可写，mod 不写）；
 - 若后来写能力恢复，**不得** 补写伪造的 `applied.json`。
 
 ### 1.10 单写者锁
@@ -550,7 +551,7 @@ Profile B 中 mod 写不了 `applied.json`，失败必须仍可见：
 | `model_error` | `MODEL` | 模型调用失败/超时/输出不可解析 |
 | `not_applied` | `INTERNAL` | 决策文书写明要生成 A，实际生成却不是 A（未真正生效） |
 | `io_error` | `IO` | 文件/目录/权限/存档读写失败 |
-| `bridge_unavailable` | `IO` | 桥不可用（Profile B/探针失败） |
+| `bridge_unavailable` | `IO` | 桥不可用（local-only/探针失败） |
 | `internal_error` | `INTERNAL` | 其它未预期错误 |
 
 未登记的 `reason_code` **不得** 导致整份文档被拒绝：读者保留原值、按 `error_code` 归类并记一条 WARN；只有结构/类型/范围非法才拒绝。这样 minor 增加原因码不会让旧端把新决策整份丢掉。
@@ -758,7 +759,7 @@ else:
 
 - 回调内 **不得** 读文件、写文件、调 llm、打日志到磁盘、GC 等待；只查内存表。
 - 本地规则只在“内存局面与当前 `gen_level_key` 匹配、候选列表可用”时生效；没有可用局面就返回 `nil`（原版），并在 `applied.json` 记 `phase: "rejected"`、`choice: null`、`applied_by: "none"`、`error_code: "TIMEOUT"` / `reason_code: "no_fresh_decision"`。
-- 若内存里连局面都没有（Profile B/刚启动）→ 返回 `nil`（原版道具），`applied.phase: "rejected"`、`applied_by: "none"`，`error_code: TIMEOUT` / `no_fresh_decision`。
+- 若内存里连局面都没有（local-only/刚启动）→ 返回 `nil`（原版道具），`applied.phase: "rejected"`、`applied_by: "none"`，`error_code: TIMEOUT` / `no_fresh_decision`。
 - **不推荐** 的备选实现：当帧返回 `nil` 让原版道具生成，下一帧再用 Morph 换成决策道具。它引入可见闪烁、可能触发两次拾取/成就判定，只在用户显式开启时使用（`apply:morph` 能力）。
 
 **应用点有两种合法实现**，协议不规定必须用哪种，只要求“决策先于生成到达”：
@@ -787,7 +788,7 @@ else:
 | state 不合法 | 插件侧 | 拒绝并写 `valid:false` | `VALIDATION` | `state_invalid` |
 | state 降级（`error_code != null`） | 插件侧 | 不调 llm，只跑规则 | 沿 state | 沿 state |
 | 读写失败/权限 | mod/插件 | 保留旧文件；本地规则 | `IO` | `io_error` |
-| 桥不可用（Profile B） | mod 启动探针 | 纯本地规则 + 气泡提示 | `IO` | `bridge_unavailable` |
+| 桥不可用（local-only） | mod 启动探针 | 纯本地规则 + 气泡提示 | `IO` | `bridge_unavailable` |
 | 未预期异常 | 任意 | 捕获、记 `INTERNAL`、本地规则 | `INTERNAL` | `internal_error` |
 
 > **本表不写 `applied_by`**：它是结果字段，唯一推导来源是 §5.3 算法；本表只描述“发生了什么、走哪条兜底”。这样不会出现 §6.3 说 `fallback`、§5.3 却判 `none` 的两套口径。
@@ -931,7 +932,7 @@ DECISION_READY
       └─(已过期/不匹配)→ EXPIRED（本地规则）
 ```
 
-每个终态 **必须** 写一次 `applied.json`（Profile A；C 在 v1.1+）或结构化日志 + 气泡（Profile B）。
+每个终态 **必须** 写一次 `applied.json`（Profile A；C 在 v1.1+）或结构化日志 + 气泡（local-only）。
 
 ### 8.2 三种失败的归类
 
@@ -957,7 +958,7 @@ DECISION_READY
 - **不读 key**：mod 永不读取/写入任何 API key；插件 **不得** 把 key 写入协议文件、日志、`reason`、`provider_id` 或模型提示。key 只存在于 DSH 侧的凭据存储与调用层。
 - **不做帧级操作**：不注入输入、不操纵玩家移动/射击、不改内存、不做逐帧脚本化操作；只读游戏状态，只通过官方 API 在决策生效点替换/生成道具。
 - **不碰账号凭证**：不读 Steam 账号/token/存档账号信息；协议不携带任何账号字段。
-- **默认不放宽 mod 文件权限**：Profile B 下 mod 不写盘；Profile A 必须由玩家显式以 `--luadebug` 启动。文档/安装向导必须原样说明：`--luadebug` 不是“给本 mod 开一个开关”，而是 **给所有 mod 放开文件访问**。
+- **默认不放宽 mod 文件权限**：无桥接时 mod 不写盘；Profile A 必须由玩家显式以 `--luadebug` 启动。文档/安装向导必须原样说明：`--luadebug` 不是“给本 mod 开一个开关”，而是 **给所有 mod 放开文件访问**。
 - **不执行远端代码**：模型/观众输出只作为 `choice`/`reason` 校验后的数据，不能当代码或路径。
 - **路径白名单**：所有文件读写限制在 `<bridge>`；拒绝路径穿越、符号链接逃逸、模型指定路径。
 - **大小上限**：见 §1.6；超限拒绝，不截断。
@@ -982,12 +983,12 @@ DECISION_READY
 1. **单生成目标 + latest-wins，没有决策队列。** 同一时刻只有一个活跃请求；多底座房、快速 reroll、房间加载时抽取只能串行或吃 `nil`/本地规则。要“每个底座都由 agent 决定”，需要池级预取/队列，属于 v2，不在 v1 承诺；Claude 补审建议的“房间级池预取/水位”同样不写进 v1，理由见 tri-party §4.5。
 2. **`applied.json` / `event.json` 是 latest-wins 回执，不是完整审计日志。** 迟到、被覆盖、被拒绝的历史主要在日志里；精确统计需要可靠回执通道。
 3. **EventSource 是通知适配器，不是可靠事件总线。** 文件模式丢事件后不能补齐；`custom` 只做通知/展示，不能驱动新玩法；新增正式事件仍需 mod 改动 + minor。
-4. **默认 Profile B，实时 agent 需显式启用 A。** B 不导出实时 state，只能预置策略/本地规则/外部 StateDoc；不要把它当“降级后还能问模型”。A 需要 `--luadebug`，代价是给所有 mod 放开文件访问，不是单 mod 开关。
+4. **v1 只支持 Profile A；无桥接 = local-only，不叫 B。** 不加 `--luadebug` 时 mod 不写任何桥文件、不读 decision，只能本地规则；不要把它当“降级后还能问模型”。A 需要 `--luadebug`（或 REPENTOGON 文件 API），代价是给所有 mod 放开文件访问，不是单 mod 开关。Profile B/C 推迟 v1.1+。
 5. **跨 major 不强制写拒绝信封，但提供可选 `plugin_status.json`。** 没有可读 codec 时插件不写 decision，但 **应该** 把 `refused/version_major` 写进状态文件；mod 无决策时读它，把原因写进 `applied.json`。文件缺失/不可读时才显示为 `TIMEOUT`。
 6. **v1 不导出地图/敌人数据。** `MapEnricher` / `EnemyEnricher` 只有在 mod 通过可选 `state` 字段导出对应数据后才成立；否则它们只是“看着能插”的占位，接入前需要 minor 扩展 state。
 7. **角色与血量上限是可选字段。** 缺省时规则按“未知”处理，可能降低选择质量；不阻塞主流程。
 8. **`source` 固定两值（llm/rule），来源细分放 `provider_id`。** 这是 captain 批准的取舍；代价是读文档的人可能把 `rule` 误当兜底，已用 §0.1 与 §3.5 的误用警告约束。
-9. **Profile C（SaveData 中继）推迟到 v1.1+，v1 不做。** 理由：把协议塞进存档会遇到数据类型受限、与存档写入/回滚机制冲突、审计困难；v1 不实现、不默认、不作为保底。等 B/A 的真实使用数据后再设计。
+9. **Profile B / C 都推迟到 v1.1+，v1 不做。** B（mod 只读 decision、不写 state）需要稳定读文件 API（t21 待证），v1 的 local-only 不消费预置决策；C（SaveData 中继）会遇到数据类型受限、与存档写入/回滚机制冲突、审计困难。v1 不实现、不默认、不作为保底；等 A 的真实使用数据后再设计。
 
 ---
 
@@ -999,4 +1000,5 @@ DECISION_READY
 | 1.0-draft.2 | 2026-11-07 | 吸收 t2 参考实现发现：明确回调 62 的生成时序、`source` 固定 `llm`/`rule`、`valid=false` + `reason_code`、允许部分响应、每次抽取恰好一个分类；`viewer`/`preset` 用 `provider_id` 表达 |
 | 1.0-draft.3 | 2026-11-07 | 吸收 t7 评审：`state.reason_code`、角色/血量上限可选字段、validity 双阶段判定、刷新/缓存/消费契约、`reroll` 禁止在回调 62 使用、provider_id 前缀交叉校验、未知 reason_code 容忍、跨 major codec-first、应用结果回执真值表、已知取舍清单 |
 | 1.0-draft.4 | 2026-11-07 | 吸收 t8 Claude 补审：必填 `session_id`、池标识必填、`actual_item_id` 必填、删除 `capabilities` 统一 `features`、`DecisionDoc` 对齐、统一 `state.ts` 时间基准、§6.3 删除 `applied_by` 列、降级白名单补 `requires`/`provider_id`、未知 provider 前缀 WARN、`max_red_hearts` 未知跳过、新增可选 `plugin_status.json`；architecture 同步 v1.0-draft.4 |
-| 1.0-draft.5 | 2026-11-07 | captain 产品取舍：默认 Profile B、Profile A 需 `--luadebug` 且会放开所有 mod 文件权限、Profile C 推迟 v1.1+、目录统一 `mods/<mod名>/`、契约条件化（不得假设 mod 可写）；architecture 同步 v1.0-draft.5 |
+| 1.0-draft.5 | 2026-11-07 | captain 产品取舍：默认 Profile B、Profile A 需 `--luadebug` 且会放开所有 mod 文件权限、Profile C 推迟 v1.1+、目录统一 `mods/<mod名>/`、契约条件化（不得假设 mod 可写）；architecture 同步 v1.0-draft.5（**该“默认 B”已被 1.1-draft.1 修正**） |
+| 1.1-draft.1 | 2026-11-07 | t24 M5/M7 决策：v1 只支持 Profile A（实时桥）+ local-only，**不再把无桥接称为 Profile B**；B/C 明确推迟 v1.1+；扩展点明确为概念约束、非代码接口；规范 minor 升到 1.1，wire 字段不变（`protocol_version` 仍 1.0） |

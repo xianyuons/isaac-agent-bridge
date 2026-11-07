@@ -1,8 +1,8 @@
-# 架构：分层、接口与扩展点（v1.0-draft.5）
+# 架构：分层、接口与扩展点（v1.1-draft.1）
 
-> 版本：v1.0-draft.5（2026-11-07，t8 Claude 补审 + captain 产品取舍回写）。协议细节见 [protocol.md](protocol.md) §12 变更记录。
-> 配套：[协议](protocol.md)、[代码规范](standards.md)。
-> 目标：把“游戏侧读局面 / 插件侧做决策 / 表现层展示”拆成四层，层与层之间只通过本文列出的接口通信；以后加新玩法（离线小模型、观众投票、地图增强、OBS 叠加）只加实现，不改核心。
+> 版本：v1.1-draft.1（2026-11-07，t24 M5/M7 决策回写）。协议细节见 [protocol.md](protocol.md) §12 变更记录。
+> 配套：[协议](protocol.md)、[代码规范](standards.md)、[M5/M7 决策](reviews/decisions-m5-m7.md)。
+> 目标：把“游戏侧读局面 / 插件侧做决策 / 表现层展示”拆成四层，层与层之间只通过本文列出的接口通信。**v1 的扩展点是概念约束，不是代码接口；改行为需改实现（见 M5 决策）。**
 
 ---
 
@@ -12,7 +12,7 @@
    - 协议里的 1500ms 是 **决策有效期/超时判定**，不是 mod 的阻塞等待；
    - mod 必须在生成前 **预取** 决策到内存；回调里只查内存表，不读盘、不调模型、不写盘；
    - 没命中就返回 `nil`（原版）或本地规则结果（必须仍属于候选池），绝不卡帧。
-2. **默认 Profile B，A 是可选高风险项。** 默认不要求玩家改启动项：mod 只读 decision，桥目录写入全在插件；代价是 **没有实时 state、实时 agent 不可用**。要实时 agent 必须用 `--luadebug` 启用 Profile A——那不是“给本 mod 开一个开关”，而是 **给所有 mod 放开文件访问**。Profile C（SaveData 中继）推迟到 v1.1+，v1 不做。**任何契约都不得假设 mod 能写盘。**
+2. **v1 只支持 Profile A 的实时桥；无桥接 = local-only，不叫 Profile B。** v1 没有实现“mod 只读 decision、不写 state”的 Profile B；原生沙箱连读 `decision.json` 所需的 `io` 都没有。玩家不加 `--luadebug`（或 REPENTOGON 文件 API）时，mod 不写任何桥文件、不读 decision，回调只跑本地规则并明确提示“桥接不可用”。要实时 agent 必须启用 Profile A——那不是“给本 mod 开一个开关”，而是 **给所有 mod 放开文件访问**。Profile B / C 推迟到 v1.1+。**任何契约都不得假设 mod 能写盘。**
 3. **气泡是事后核验。** 气泡在 `POST_PICKUP_INIT`（底座实体初始化）比较“实际生成的 item id”和“决策的 item id”之后再弹，用于解释这次是 llm 还是兜底；不在生成前假装已经生效。
 
 ### 0.1 回调 62 的真实时机（别把“生成”当“玩家拿走”）
@@ -26,6 +26,8 @@
 ---
 
 ## 1. 分层与依赖方向
+
+> 图中的 Provider / Presenter / EventSource 是 **逻辑角色**，不是 v1 可注册的代码接口（M5 决策 A）；v1 改变行为要改单体实现。
 
 ```mermaid
 flowchart TB
@@ -93,7 +95,7 @@ flowchart TB
 
 | 层 | 可以读 | 可以写 | 禁止 |
 | --- | --- | --- | --- |
-| ① 游戏侧 | 游戏 API、`decision.json` | `state.json` / `event.json` / `applied.json`（**仅 Profile A**；B 不写） | 联网、读 key、调模型、阻塞帧、做帧级输入操作 |
+| ① 游戏侧 | 游戏 API、`decision.json` | `state.json` / `event.json` / `applied.json`（**v1 仅 Profile A**；local-only 不写） | 联网、读 key、调模型、阻塞帧、做帧级输入操作 |
 | ② 传输层 | 桥目录/管道/端口 | 对应传输介质 | 业务判断、修改文档内容、决定选择 |
 | ③ 决策层 | `state.json` / `event.json` | `decision.json`、`plugin_status.json`、`bridge.lock` | 读写 state/event/applied 内容、碰游戏内存、执行模型代码 |
 | ④ 表现层 | decision/applied/event 的只读视图 | 自己的输出通道（TTS/弹幕/OBS） | 反向影响决策、阻塞决策路径、失败上报给决策层当错误 |
@@ -102,22 +104,26 @@ flowchart TB
 
 ---
 
-## 2. 写入模型：默认 B，A 可选，C 推迟到 v1.1+
+## 2. 写入模型：v1 只支持 Profile A；无桥接 = local-only；B/C v1.1+
 
-| | Profile B 单向只读（**默认**） | Profile A 双向文件桥（可选） | Profile C SaveData 中继（v1.1+） |
+| | Profile A（**v1 唯一桥接**） | Profile B（v1.1+，未实现） | Profile C（v1.1+，未实现） |
 | --- | --- | --- | --- |
-| 前提 | mod 只读 `decision.json`，**不需要改启动项** | mod 可读可写 `<bridge>`，需要 `--luadebug` 启动 | `Mod:SaveData` + 插件侧 feeder，v1 不做 |
-| `state/event/applied` 写者 | **无**（不导出实时局面） | mod | 插件侧 feeder（内容仍由 mod 生成） |
+| 前提 | mod 可读可写 `<bridge>`，需要 `--luadebug` 或 REPENTOGON 文件 API | mod 只读 `decision.json`，不写 state；需稳定读文件 API（t21 待证） | `Mod:SaveData` + 插件侧 feeder |
+| `state/event/applied` 写者 | mod | **无**（不导出实时局面） | 插件侧 feeder（内容仍由 mod 生成） |
 | `decision.json` / `plugin_status.json` / `bridge.lock` 写者 | 插件 | 插件 | 插件 |
-| 实时 agent | ❌ 只能预置策略/本地规则，或由外部提供 StateDoc | ✅ | ⚠️ 取决于 SaveData 可见性；v1.1+ 再评估 |
-| 主要风险 | 功能受限，但默认安全 | `--luadebug` **给所有 mod 开文件访问**，不是“本 mod 的开关” | 协议塞存档：类型受限、易与存档机制冲突、审计困难 |
-| 失败可见性 | 气泡 + `Isaac.DebugString` + 插件 `plugin_status.json` | `applied.json` | `applied.json` |
+| 实时 agent | ✅ | ❌（只能预置决策/本地规则） | ⚠️ 取决于 SaveData 可见性 |
+| 主要风险 | `--luadebug` **给所有 mod 开文件访问**，不是“本 mod 的开关” | 读文件 API 未证明；不能实时问模型 | 协议塞存档：类型受限、易与存档机制冲突、审计困难 |
+| 失败可见性 | `applied.json` | 气泡 + `Isaac.DebugString` + `plugin_status.json` | `applied.json` |
 
-- **默认是 B，不是 A。** 玩家不改启动项时，mod 只读 decision；桥目录的所有写入（decision/status/lock）由插件完成。B **不导出实时 state**，因此实时 agent 不可用；要么用预置策略/本地规则，要么由外部把完整 StateDoc 交给插件。**不得** 把 B 说成“降级后还能问模型”。
-- **A 是显式可选项。** 需要以 `--luadebug` 启动；代价不是“给这个 mod 开一个开关”，而是 **放开所有 mod 的文件权限**。安全边界见 §9；不接受这个代价的玩家应留在 B。
-- **C 推迟到 v1.1+。** v1 不做 SaveData 中继；理由：把协议塞进存档会遇到数据类型受限、与存档写入/回滚机制冲突、审计困难；等 B/A 的真实使用数据后再设计。
-- **启动探针**：只有尝试 A 时才写 `.probe.tmp` → rename → 读回 → 删除；读写分别判定；结果写日志并（可写时）写进 `state.features`。B 下探针失败是预期，不得在帧回调里做。
-- **契约条件式（硬约束）**：任何地方都 **不得** 假设 mod 能写盘。`state/event/applied` 只有 Profile A 由 mod 写；Profile B 没有这三份文件；Profile C 的 feeder 是 v1.1+ 的传输层组件，v1 不实现。
+**v1 实际只有两种运行形态：**
+
+1. **Profile A（桥接，能实时 agent）**：玩家以 `--luadebug` 启动（或 REPENTOGON 暴露文件 API），探针读写通过；mod 写 `state/event/applied`，插件写 `decision/plugin_status`。
+2. **local-only（无桥接，不能实时 agent）**：没有 `--luadebug`/探针失败；mod 不写任何桥文件、不读 `decision.json`，回调只跑本地规则，气泡提示“桥接不可用（本地规则）”。**这不是 Profile B**，不要称它为默认 B，也不要暗示预置决策可用。
+
+**Profile B（v1.1+）**：真正的“mod 只读 decision、不写 state”；需要 t21 证明有稳定读文件 API。**v1 未实现**。Profile C（SaveData 中继）同样 v1.1+，理由见 protocol §11.9。
+
+- **启动探针**：写 `.probe.tmp` → rename → 读回 → 删除；读写分别判定；结果写日志并（可写时）写进 `state.features`。探针失败 → local-only，不进入桥接路径；**不得** 在帧回调里做。
+- **契约条件式（硬约束）**：任何地方都 **不得** 假设 mod 能写盘。`state/event/applied` 只有 Profile A 由 mod 写；local-only 没有这三份文件。
 - `plugin_status.json` 是插件诊断（protocol §1.11），B/A 都由插件写、mod 只读；它不替代 `applied.json`。
 - 共同点：**`decision.json` 是唯一必需方向，mod 永不阻塞。**
 
@@ -402,7 +408,7 @@ interface Presenter {
 Lua 没有 interface，统一用“字段 + 函数签名”的 table 描述；所有实现放 `local`，禁止写 `_G`。
 
 ```lua
---- 传输层（mod 侧通常只有 file 实现；Profile B 只有 read_decision）
+--- 传输层（mod 侧通常只有 file 实现；无桥接时没有 read_decision）
 --- @class BridgePort
 --- @field kind string                    -- "file"
 --- @field read_decision fun(request_id: string): table|nil, string|nil
@@ -442,7 +448,13 @@ Lua 没有 interface，统一用“字段 + 函数签名”的 table 描述；�
 
 ---
 
-## 4. 四类可插拔接口
+## 4. 四类扩展点（v1 概念约束，不是代码接口）
+
+> **v1 的现实（M5 决策 A）：这四类是概念约束，不是代码接口。** 插件是单体
+> `plugin/index.js`，mod 是单体 `mods/isaac_agent/main.lua`；没有 `register*()`、没有注册表、
+> 没有依赖注入。**改行为 = 改对应实现文件 + 跑测试**；v1 **不支持第三方扩展实现**，也不承诺
+> 热插拔。下面的 TypeScript 接口是维护者分层/未来 v1.1 抽接口的设计稿，不是 v1 已交付 API。
+> 详见 [M5/M7 决策](reviews/decisions-m5-m7.md)。
 
 ### 4.1 DecisionProvider
 
@@ -453,7 +465,7 @@ Lua 没有 interface，统一用“字段 + 函数签名”的 table 描述；�
 | ViewerVote | `viewer:bilibili` | `rule` | `false` | `mode=viewer` 且有票 | 确定性聚合，不调模型 |
 | Preset | `preset:scripted` | `rule` | `false` | 存在预置决策且匹配 gen key | 离线/QA/演示 |
 
-**假想实现（最小）**：
+**示意实现（未随 v1 交付；只说明职责与数据流，不是可加载的扩展）**：
 
 ```ts
 // 1) LLM
@@ -643,7 +655,7 @@ function BubblePresenter:close() self.text = nil end
 
 - Presenter **不得** 改 `choice`、不得重试决策、不得在失败时抛到决策层。
 - `BubblePresenter` 的 `view` 来自 `applied.json`（真实结果），而不是 `decision.json`（候选意图）；这样“说了拿 A、实际拿了 B”不会骗玩家。
-- **可插拔边界**：气泡固定在 mod 侧（必须画进游戏），插件侧换不了；`voice` / `danmaku` / `overlay` 才是插件侧可自由替换的通道。把气泡也当成“换个 Presenter 就行”是假扩展点。
+- **可插拔边界**：气泡固定在 mod 侧（必须画进游戏），插件侧换不了；`voice` / `danmaku` / `overlay` 才是插件侧可替换的通道。但 v1 没有代码接口层（M5），换这些通道仍需改 `plugin/index.js`，不是热插拔。
 
 ---
 
@@ -693,6 +705,8 @@ interface ProtocolCodec {
 
 ## 7. 时序（生成链路）
 
+> **本图只描述 Profile A（v1 唯一桥接，需 `--luadebug` 或 REPENTOGON 文件 API）。** 无桥接时 mod 不写 state/event，不进入本图，只走本地规则。
+
 ```mermaid
 sequenceDiagram
   participant M as mod（Lua）
@@ -733,7 +747,7 @@ sequenceDiagram
 - **当帧**：`MC_PRE_GET_COLLECTIBLE` 只做内存查表；没有就返回 `nil`（原版）或本地规则结果，记兜底；不做 I/O。
 - **备选**：返回 nil 后下一帧 Morph 替换（有闪烁、可能双重生成/拾取判定），只在显式开启 `apply:morph` 时使用。
 - **事后核验**：`POST_PICKUP_INIT`（底座实体初始化）比较 `actual_item_id` 与实际生成 id；不一致 → `applied_by=fallback`，气泡解释原因。
-- **失败可见**：`applied.json` + 气泡 + 限频日志；Profile B 用气泡 + `DebugString`。
+- **失败可见**：`applied.json` + 气泡 + 限频日志；local-only 用气泡 + `DebugString`。
 
 **应用点的两种实现**（协议不规定必须用哪种，只要求决策先于生成到达）：
 
@@ -748,18 +762,20 @@ sequenceDiagram
 
 ---
 
-## 8. 扩展演练（加新玩法时改哪里）
+## 8. 扩展演练（维护者改哪里；v1 不是热插拔）
 
 | 新需求 | 加什么 | 改协议？ | 改核心？ |
 | --- | --- | --- | --- |
-| 预测下一层道具 | `NextFloorPreviewEnricher` | 否（内存）；要落盘才加可选 `state.enrichments` | 否 |
-| 离线小模型替代在线 llm | 新 `DecisionProvider`（`source:"llm"`, `id:"llm:local_small"`） | 否 | 否 |
-| B 站观众投票 | `BilibiliDanmakuSource` + `ViewerVoteProvider` + `DanmakuPresenter` | 否（`custom` 已预留） | 否 |
-| 聊天接口 | `ChatSource` 归一化为 `custom{name:"chat_message"}`；要影响决策就新增 Provider | 否 | 否 |
-| OBS 叠加层 | `ObsOverlayPresenter`（HTTP/WS） | 否 | 否 |
-| 新传输（管道/HTTP/WS） | 新 `BridgePort` 适配器 | 否 | 否 |
-| 新动作（如使用主动道具） | 能力 `action:*` + 白名单 + minor | 是（minor） | 否 |
-| 新事件类型 | 先 `custom`；稳定后再升正式事件（minor） | 视情况 | 否 |
+| 预测下一层道具 | `NextFloorPreviewEnricher` | 否（内存）；要落盘才加可选 `state.enrichments` | 是（v1 改实现；v1.1 抽接口） |
+| 离线小模型替代在线 llm | 新 `DecisionProvider`（`source:"llm"`, `id:"llm:local_small"`） | 否 | 是（v1 改实现；v1.1 抽接口） |
+| B 站观众投票 | `BilibiliDanmakuSource` + `ViewerVoteProvider` + `DanmakuPresenter` | 否（`custom` 已预留） | 是（v1 改实现；v1.1 抽接口） |
+| 聊天接口 | `ChatSource` 归一化为 `custom{name:"chat_message"}`；要影响决策就新增 Provider | 否 | 是（v1 改实现；v1.1 抽接口） |
+| OBS 叠加层 | `ObsOverlayPresenter`（HTTP/WS） | 否 | 是（v1 改实现；v1.1 抽接口） |
+| 新传输（管道/HTTP/WS） | 新 `BridgePort` 适配器 | 否 | 是（v1 改实现；v1.1 抽接口） |
+| 新动作（如使用主动道具） | 能力 `action:*` + 白名单 + minor | 是（minor） | 是（v1 改实现；v1.1 抽接口） |
+| 新事件类型 | 先 `custom`；稳定后再升正式事件（minor） | 视情况 | 是（v1 改实现；v1.1 抽接口） |
+
+> 这张表是 **维护者改造指引**，不是“装一个包就能扩展”的承诺；v1 没有第三方扩展 API。v1.1 才按真实需求抽最小接口层（M5 决策 §1.4）。
 
 ---
 
@@ -769,7 +785,7 @@ sequenceDiagram
 - **不读 key**：mod 永不接触 key；插件不把 key 写进协议、日志、气泡、`reason`、`provider_id`。
 - **不做帧级操作**：不注入输入、不改内存、不逐帧脚本化玩家行为；只读状态 + 官方 API 在生效点替换/生成道具。
 - **不碰账号凭证**：不读 Steam 账号/token/存档账号数据；协议无账号字段。
-- **默认不放宽 mod 文件权限**：Profile B 下 mod 不写盘；只有玩家显式使用 `--luadebug` 才启用 Profile A。必须原样告知：`--luadebug` 不是“给本 mod 开一个开关”，而是 **给所有 mod 放开文件访问**；不能把它包装成普通功能开关。
+- **默认不放宽 mod 文件权限**：v1 无桥接时 mod 不写盘；只有玩家显式使用 `--luadebug` 才启用 Profile A。必须原样告知：`--luadebug` 不是“给本 mod 开一个开关”，而是 **给所有 mod 放开文件访问**；不能把它包装成普通功能开关。
 - **不执行模型/观众输出**：输出只作为校验后的数据；不执行代码、不接受模型指定路径。
 - **不做参考实现的过设计**：不引入 16 池 / 160 候选目录 / 多层水位；v1 一次请求一个生成目标（底座或道具池）、候选 ≤64、缓存只按 `gen_level_key` 保留少量条目。
 - **不保证事件必达**：file 模式事件可丢；决策正确性以 state 为准。
