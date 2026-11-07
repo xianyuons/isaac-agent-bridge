@@ -1,0 +1,7 @@
+<metadata>
+    <name>isaac_agent_profile_b_probe</name>
+    <directory>isaac_agent_probe</directory>
+    <description>Spike probe for the isaac-agent-bridge project. Answers whether a mod can read/write files under default startup (no --luadebug). Prints [PROBE] lines to log.txt. Safe: only touches its own mod data file.</description>
+    <version>0.0.1</version>
+    <visibility>Private</visibility>
+</metadata>
