@@ -31,6 +31,9 @@ tests/lua_logic_test.lua — isaac_agent 离线逻辑测试
   T25 消费清整个 K（R1→R2→生成，R2 迟到按 late 丢弃）
   T26 兜底生成同样清整个 K（之后同 K 的决策不得再被接受）
   T27 回执只在核验通过后写；超窗结算为 rejected/applied_by=none
+  T28 capabilities 字段必须已删除（draft.4 统一为 features）
+  T29 ts 毫秒精度（墙钟锚点 + 单调增量）
+  T30 有效期边界按毫秒判定，且 ts 不参与
 
 运行：
   lua tests/lua_logic_test.lua
@@ -947,6 +950,87 @@ do
     pickup(cand)
     local after = read_applied()
     eq(after.applied_by, "none", "超窗后的迟到核验不得改写为成功")
+end
+
+-- ============================================================
+-- T28 `capabilities` 字段必须已删除（draft.4 统一为 features）
+--     （回归：build_state_doc 又把 capabilities 写回来了，两端口径分叉）
+-- ============================================================
+do
+    section("T28 capabilities 已删除")
+    reset_world()
+    begin_request()
+    local text = read_file(bpath("state.json"))
+    check(text ~= nil, "state.json 应存在")
+    local doc = T.decode(text)
+    check(doc.features ~= nil and #doc.features > 0, "features 必须存在且非空")
+    check(doc.capabilities == nil, "capabilities 字段必须已删除")
+    check(text:find('"capabilities"', 1, true) == nil, "state.json 文本里不得出现 capabilities")
+end
+
+-- ============================================================
+-- T29 ts 毫秒精度（协议预算用毫秒；秒级 ts 会让 validity 差最多 1s）
+-- ============================================================
+do
+    section("T29 ts 毫秒精度")
+    reset_world()
+    M.hooks.on_new_level()
+    -- 模拟“已对齐墙钟”：锚点落在整秒边界
+    local clock = T.CLOCK
+    check(clock ~= nil, "应暴露 CLOCK 锚点（ts 毫秒精度的前提）")
+    if clock ~= nil then
+        clock.synced = true
+        clock.epoch_base = 1793982600000
+        clock.mono_base = clock_ms
+    end
+
+    T.request_state("room_enter", "treasure")
+    T.flush_writes()
+    local ts1 = T.decode(read_file(bpath("state.json"))).ts
+
+    clock_ms = clock_ms + 40                    -- 同一秒内推进 40ms
+    T.request_state("room_enter", "treasure")
+    T.flush_writes()
+    local doc2 = T.decode(read_file(bpath("state.json")))
+
+    eq(ts1 % 1000, 0, "锚点应落在整秒边界")
+    eq(doc2.ts - ts1, 40, "40ms 后 ts 必须差 40（秒级实现会是 0 或 1000）")
+    eq(doc2.x_clock, "epoch", "已对齐时 x_clock 应为 epoch")
+end
+
+-- ============================================================
+-- T30 有效期边界按毫秒判定，且 ts 不参与判定
+-- ============================================================
+do
+    section("T30 有效期毫秒边界")
+    -- 恰好等于 validity_ms：仍可用（<= 边界）
+    reset_world()
+    local rid1, key1 = begin_request()
+    local cand1 = T.S.current.candidates[1].item_id
+    clock_ms = clock_ms + 1500
+    publish(decision_doc(rid1, key1, { type = "item", item_id = cand1 }))
+    T.poll_decision()
+    check(T.S.decision ~= nil, "恰好等于 validity_ms 时应接受")
+
+    -- 多 1ms：必须迟到
+    reset_world()
+    local rid2, key2 = begin_request()
+    local cand2 = T.S.current.candidates[1].item_id
+    clock_ms = clock_ms + 1501
+    publish(decision_doc(rid2, key2, { type = "item", item_id = cand2 }))
+    T.poll_decision()
+    check(T.S.decision == nil, "超过 validity_ms 1ms 必须判迟到")
+    eq(T.S.rejected and T.S.rejected.reason_code, "late", "reason_code")
+
+    -- ts 写得很旧但实际未过期：判定应只看单调毫秒，不看 ts
+    reset_world()
+    local rid3, key3 = begin_request()
+    local cand3 = T.S.current.candidates[1].item_id
+    local doc3 = decision_doc(rid3, key3, { type = "item", item_id = cand3 })
+    doc3.ts = 1
+    publish(doc3)
+    T.poll_decision()
+    check(T.S.decision ~= nil, "ts 极旧但实际未过期，仍应接受（判定用单调毫秒）")
 end
 
 -- ============================================================
