@@ -14,8 +14,8 @@ access from the mod.
 
 > **Status: offline-verified, not smoke-tested on a real game install.**
 > Contract: `docs/protocol.md` **v1.0-draft.5** (wire version `1.0`). The Lua logic is
-> covered by 133 offline assertions, the plugin by 111 offline assertions, and the JSON
-> contract by `tools/mock_e2e.py` (4 scenarios / 52 assertions). The author's machine does
+> covered by 133 offline assertions, the plugin by 157 offline assertions, and the JSON
+> contract by `tools/mock_e2e.py` (4 scenarios / 87 assertions). The author's machine does
 > not have REPENTOGON installed, so **no end-to-end run inside the actual game has been
 > performed yet**. Treat this as a working prototype, not a polished release.
 
@@ -282,10 +282,10 @@ logs keys or full absolute paths.
 python tests/run_lua_test.py
 $env:ISAAC_AGENT_LUA = "53"; python tests/run_lua_test.py   # game-like runtime
 
-# 2) plugin regression — 111 assertions (no DSH process, no network)
+# 2) plugin regression — 157 assertions (no DSH process, no network)
 node plugin/tests/plugin.test.mjs
 
-# 3) end-to-end JSON contract — 4 scenarios, 52 assertions
+# 3) end-to-end JSON contract — 4 scenarios, 87 assertions
 python tools/mock_e2e.py
 
 # 4) danmaku/viewer-tendency offline simulator (fixed fixture, no network)
@@ -295,9 +295,13 @@ python -m unittest discover -s tools/tests -p "test_*.py"
 
 `tools/mock_e2e.py` simulates the game side (writes `state.json`), drives the real
 `plugin/index.js` with a fake LLM stream, and validates the resulting `decision.json`
-against `docs/protocol.md` for four cases: valid state, missing field, out-of-pool item id,
-and expired state. It prints a per-assertion PASS/FAIL and a four-scenario conclusion;
-exit code 0 means everything passed.
+against `docs/protocol.md` (draft.5) for four cases: valid state, missing field, out-of-pool
+item id, and expired state. It also enforces `decision.session_id` echoing
+`state.session_id`, and validates the optional `plugin_status.json` (exists, ≤ 8 KiB,
+`status ∈ {ready,degraded,refused}`, all five `x_runtime.error_code_counts` keys present
+and non-negative). It prints a per-assertion PASS/FAIL and a four-scenario conclusion;
+exit code 0 means everything passed. Use `--plugin <index.js>` to point it at another
+build (e.g. an older plugin to confirm the tightened checks actually go red).
 
 > **Coverage boundary:** the mock covers the plugin and the JSON contract only. It does
 > **not** read or assert `applied.json` — that receipt is written by the game-side mod after
@@ -309,7 +313,7 @@ exit code 0 means everything passed.
 and prints the four tendency weights; it never opens a network connection and never writes
 viewer text to disk. See [docs/danmaku.md](docs/danmaku.md).
 
-The plugin now ships its own regression suite: `node plugin/tests/plugin.test.mjs` (111 assertions, no DSH process or network needed).
+The plugin now ships its own regression suite: `node plugin/tests/plugin.test.mjs` (157 assertions, no DSH process or network needed).
 
 ---
 
@@ -414,8 +418,8 @@ Profile C（SaveData 中继）推迟到 v1.1+，v1 不实现、也不得声称�
 
 ```powershell
 python tests/run_lua_test.py     # Lua 逻辑 133 条断言
-node plugin/tests/plugin.test.mjs # 插件回归 111 条断言（不需要 DSH 进程/网络）
-python tools/mock_e2e.py         # 四种场景的 mock 联调，52 条断言
+node plugin/tests/plugin.test.mjs # 插件回归 157 条断言（不需要 DSH 进程/网络）
+python tools/mock_e2e.py         # 四种场景的 mock 联调，87 条断言
 python tools/danmaku_sim.py      # 弹幕倾向离线模拟（固定 32 条样例，不联网）
 python -m unittest discover -s tools/tests -p "test_*.py"
 ```
@@ -423,6 +427,11 @@ python -m unittest discover -s tools/tests -p "test_*.py"
 **覆盖边界**：mock 只覆盖插件与 JSON 契约，**不读也不断言 `applied.json`**——回执由 mod 在
 `POST_PICKUP_INIT` 核验后写（生成当帧可能还没有），这部分由 `tests/lua_logic_test.lua`
 覆盖。mock 全绿不代表 applied/回执行为已被验证。
+
+**draft.5 严格项**：mock 现在要求 `decision.session_id` 回显 `state.session_id`，并校验
+`plugin_status.json`（存在、≤ 8 KiB、`status ∈ {ready,degraded,refused}`、
+`x_runtime.error_code_counts` 五类齐全且非负）。用 `--plugin <index.js>` 可指向旧构建做
+“红测试”，确认这些检查真的会失败。
 
 ## 现实边界（如实说明）
 
@@ -443,6 +452,7 @@ python -m unittest discover -s tools/tests -p "test_*.py"
 ## 许可
 
 [MIT](LICENSE)。
+
 
 
 

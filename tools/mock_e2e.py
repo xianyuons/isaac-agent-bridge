@@ -2,7 +2,8 @@
 """离线的 mod ↔ 插件 mock 联调（不启动游戏、不访问网络、不调用真实模型）。
 
 它模拟游戏侧写出 `state.json`，用一个**假的 DSH LLM 流**驱动 `plugin/index.js` 的
-`isaac_decide`，再按 `docs/protocol.md` 校验插件写出的 `decision.json`。
+`isaac_decide`，再按 `docs/protocol.md`（draft.5）校验插件写出的 `decision.json` 与
+`plugin_status.json`。
 
 四个场景（`docs/protocol.md` §2.8 / §3.3 / §6.1 / §6.3）：
 
@@ -13,13 +14,19 @@
 3. invalid_id   模型两次都返回候选池外的 id → 兜底规则决策，`invalid_id` 留痕。
 4. timeout      state 已过有效期 → 不调模型，直接规则兜底，`TIMEOUT` 留痕。
 
+每个场景还做 draft.5 的严格校验：
+- `decision.session_id` 必填，且必须回显 `state.session_id`；
+- `plugin_status.json` 存在、≤ 8 KiB、`status ∈ {ready,degraded,refused}`、
+  `x_runtime.error_code_counts` 五类齐全且为非负整数。
+
 输入是固定样例（`protocol/examples/01-success.json` 中的 state 文档）加当前墙钟，
 没有随机数；退出码 0 表示全部通过，1 表示有场景失败，2 表示环境/参数错误。
 
 用法（在仓库根目录）：
 
     python tools/mock_e2e.py
-    python tools/mock_e2e.py --keep      # 保留临时桥目录，便于查文件
+    python tools/mock_e2e.py --keep                    # 保留临时桥目录，便于查文件
+    python tools/mock_e2e.py --plugin <index.js>       # 指定被测插件（旧版本“红测试”）
 
 前置：Node.js >= 20（插件要求），Python >= 3.10。不需要 DSH 进程、不需要 API key。
 """
@@ -47,11 +54,17 @@ ERROR_CODES = {"IO", "TIMEOUT", "VALIDATION", "MODEL", "INTERNAL"}
 SAFE_REASON_CODES = {"no_candidate", "player_dead"}
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 DECISION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 GEN_LEVEL_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 PROTOCOL_VERSION_RE = re.compile(r"^\d+\.\d+(\.\d+)?$")
 PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9_.:-]{2,63}$")
 CONTROL_CHAR_RE = re.compile(r"[\u0000-\u001f\u007f-\u009f]")
+
+# draft.5 的可选诊断文件（插件写、mod/QA 读）。
+PLUGIN_STATUS_FILE = "plugin_status.json"
+MAX_STATUS_BYTES = 8 * 1024
+STATUS_VALUES = {"ready", "degraded", "refused"}
 
 # 测试用假模型必须“看起来像”合法的 DSH 选择，方便断言写盘结果。
 LLM_MODEL = "mock-model"
@@ -134,6 +147,7 @@ def make_state(now_ms: int, request_id: str) -> dict[str, Any]:
 
 def run_plugin(
     harness: Path,
+    plugin_path: Path,
     bridge_dir: Path,
     state: dict[str, Any],
     responses: list[str],
@@ -156,7 +170,7 @@ def run_plugin(
     )
 
     completed = subprocess.run(
-        ["node", str(harness), str(PLUGIN_PATH), str(request_path)],
+        ["node", str(harness), str(plugin_path), str(request_path)],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -184,6 +198,69 @@ def read_decision(bridge_dir: Path) -> dict[str, Any] | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_plugin_status(bridge_dir: Path) -> dict[str, Any] | None:
+    path = bridge_dir / PLUGIN_STATUS_FILE
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def expect_plugin_status(
+    checker: Checker,
+    bridge_dir: Path,
+    scenario: str,
+    expected_status: str,
+) -> dict[str, Any] | None:
+    """校验 draft.5 §1.11 的 plugin_status.json（存在/大小/枚举/x_runtime 计数键）。"""
+    path = bridge_dir / PLUGIN_STATUS_FILE
+    exists = path.is_file()
+    checker.ok(f"[{scenario}] plugin_status.json 已写出", exists)
+    if not exists:
+        return None
+
+    size = path.stat().st_size
+    checker.ok(
+        f"[{scenario}] plugin_status.json ≤ 8 KiB",
+        size <= MAX_STATUS_BYTES,
+        f"{size} bytes",
+    )
+    try:
+        doc = read_plugin_status(bridge_dir)
+    except json.JSONDecodeError as exc:
+        checker.ok(f"[{scenario}] plugin_status.json 可解析", False, str(exc))
+        return None
+    checker.ok(f"[{scenario}] plugin_status.json 可解析", isinstance(doc, dict))
+    if not isinstance(doc, dict):
+        return None
+
+    status = doc.get("status")
+    checker.ok(
+        f"[{scenario}] status 在 ready/degraded/refused 内",
+        status in STATUS_VALUES,
+        f"status={status!r}",
+    )
+    checker.ok(
+        f"[{scenario}] status={expected_status}",
+        status == expected_status,
+        f"actual={status!r}",
+    )
+
+    runtime = doc.get("x_runtime")
+    counts = runtime.get("error_code_counts") if isinstance(runtime, dict) else None
+    checker.ok(
+        f"[{scenario}] x_runtime.error_code_counts 五类齐全",
+        isinstance(counts, dict) and all(code in counts for code in ERROR_CODES),
+        f"keys={sorted(counts) if isinstance(counts, dict) else counts!r}",
+    )
+    checker.ok(
+        f"[{scenario}] error_code_counts 均为非负整数",
+        isinstance(counts, dict)
+        and all(isinstance(counts.get(code), int) and counts.get(code) >= 0 for code in ERROR_CODES),
+        f"counts={counts!r}",
+    )
+    return doc
+
+
 def tmp_leftovers(bridge_dir: Path) -> list[str]:
     return sorted(p.name for p in bridge_dir.glob("decision.json.tmp.*"))
 
@@ -206,6 +283,10 @@ def validate_decision(doc: Any, state: dict[str, Any]) -> list[str]:
         need(int(version.split(".")[0]) == PROTOCOL_MAJOR, "protocol_version major 不是 1")
 
     need(doc.get("request_id") == state.get("request_id"), "request_id 没有回显 state")
+    session_id = doc.get("session_id")
+    need(isinstance(session_id, str) and bool(SESSION_ID_RE.match(session_id or "")),
+         "session_id 缺失或格式非法（draft.5 必填）")
+    need(session_id == state.get("session_id"), "session_id 没有回显 state.session_id")
     need(isinstance(doc.get("decision_id"), str) and bool(DECISION_ID_RE.match(doc["decision_id"])),
          "decision_id 缺失或格式非法")
     need(doc.get("gen_level_key") == state.get("gen_level_key"), "gen_level_key 与 state 不一致")
@@ -346,6 +427,11 @@ def expect_decision(
 def main() -> int:
     parser = argparse.ArgumentParser(description="isaac-agent 离线 mock 联调（四种场景）")
     parser.add_argument("--keep", action="store_true", help="保留临时桥目录，便于检查文件")
+    parser.add_argument(
+        "--plugin",
+        default=str(PLUGIN_PATH),
+        help="被测插件入口（默认仓库自带的 plugin/index.js；用于旧版本对照的“红测试”）",
+    )
     args = parser.parse_args()
 
     if hasattr(sys.stdout, "reconfigure"):
@@ -353,16 +439,18 @@ def main() -> int:
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+    plugin_path = Path(args.plugin).resolve()
     if shutil.which("node") is None:
         print("找不到 node；请安装 Node.js >= 20", file=sys.stderr)
         return 2
-    for required in (PLUGIN_PATH, EXAMPLE_PATH):
+    for required in (plugin_path, EXAMPLE_PATH):
         if not required.is_file():
             print(f"缺少文件：{required}（请在仓库根目录运行）", file=sys.stderr)
             return 2
 
     print("isaac-agent mock e2e：state.json → isaac_decide → decision.json（离线）")
     print(f"仓库：{REPO_ROOT}")
+    print(f"被测插件：{plugin_path}")
 
     checker = Checker()
     work_dir = Path(tempfile.mkdtemp(prefix="isaac-mock-e2e-"))
@@ -379,7 +467,7 @@ def main() -> int:
             {"item_id": MOCK_OK_ID, "reason": "红心告急，先补红心", "confidence": 0.72},
             ensure_ascii=False,
         )]
-        payload = run_plugin(harness, bridge, state, responses)
+        payload = run_plugin(harness, plugin_path, bridge, state, responses)
         result = payload.get("result", {})
         print(f"  插件结果：ok={result.get('ok')} written={result.get('written')} "
               f"source={result.get('source')} choice={result.get('choice')}")
@@ -405,6 +493,7 @@ def main() -> int:
         checker.ok("isaac_state 读取成功", state_read.get("ok") is True)
         checker.ok("isaac_state 未标记 stale", state_read.get("stale") is False,
                    f"stale={state_read.get('stale')}")
+        expect_plugin_status(checker, bridge, "valid", "ready")
 
         # ── 场景 2：缺字段 ──────────────────────────────────────────────
         checker.section("场景 2/4：缺字段")
@@ -413,7 +502,7 @@ def main() -> int:
         state_2a = make_state(now_ms, "r-mock-missing-0002")
         del state_2a["state"]["items"]
         bridge_2a = work_dir / "bridge-missing-body"
-        payload = run_plugin(harness, bridge_2a, state_2a, responses)
+        payload = run_plugin(harness, plugin_path, bridge_2a, state_2a, responses)
         result = payload.get("result", {})
         print(f"  插件结果：ok={result.get('ok')} written={result.get('written')} "
               f"valid={result.get('valid')} reason_code={result.get('reason_code')}")
@@ -431,6 +520,7 @@ def main() -> int:
             checker.ok("[2a] error_code=VALIDATION", decision_2a.get("error_code") == "VALIDATION")
             checker.ok("[2a] reason_code=missing_field", body.get("reason_code") == "missing_field",
                        f"actual={body.get('reason_code')}")
+        expect_plugin_status(checker, bridge_2a, "missing-body", "refused")
 
         # 2b：信封缺 request_id → 不得写 decision，旧文件原样保留
         print("  [2b] 缺 request_id → 期望不写 decision、旧文件不动")
@@ -441,7 +531,7 @@ def main() -> int:
         sentinel = bridge_2b / "decision.json"
         sentinel_text = '{"sentinel":"keep-me"}'
         sentinel.write_text(sentinel_text, encoding="utf-8")
-        payload = run_plugin(harness, bridge_2b, state_2b, responses)
+        payload = run_plugin(harness, plugin_path, bridge_2b, state_2b, responses)
         result = payload.get("result", {})
         print(f"  插件结果：ok={result.get('ok')} written={result.get('written')} "
               f"reason_code={result.get('reason_code')}")
@@ -454,6 +544,7 @@ def main() -> int:
                    sentinel.read_text(encoding="utf-8") == sentinel_text)
         checker.ok("[2b] 没有调用模型", payload.get("llm_calls") == 0,
                    f"llm_calls={payload.get('llm_calls')}")
+        expect_plugin_status(checker, bridge_2b, "missing-envelope", "refused")
 
         # ── 场景 3：非法 id → 两次失败后规则兜底 ────────────────────────
         checker.section("场景 3/4：模型返回候选池外的 id → 重试一次 → 规则兜底")
@@ -461,7 +552,7 @@ def main() -> int:
         bridge = work_dir / "bridge-invalid-id"
         bad = json.dumps({"item_id": MOCK_BAD_ID, "reason": "编造的 id", "confidence": 0.9},
                          ensure_ascii=False)
-        payload = run_plugin(harness, bridge, state, [bad, bad])
+        payload = run_plugin(harness, plugin_path, bridge, state, [bad, bad])
         result = payload.get("result", {})
         print(f"  插件结果：ok={result.get('ok')} written={result.get('written')} "
               f"source={result.get('source')} error_code={result.get('error_code')} "
@@ -483,6 +574,7 @@ def main() -> int:
                        f"actual={body.get('choice')}")
             checker.ok("选的不是模型编造的 id",
                        body.get("choice", {}).get("item_id") != MOCK_BAD_ID)
+        expect_plugin_status(checker, bridge, "invalid-id", "degraded")
 
         # ── 场景 4：超时 → 不调模型，规则兜底 ──────────────────────────
         checker.section("场景 4/4：state 已过有效期 → 不调模型，规则兜底")
@@ -490,7 +582,7 @@ def main() -> int:
         state = make_state(timeout_now, "r-mock-timeout-0005")
         state["ts"] = timeout_now - 5000  # validity_ms=1500，早已过期
         bridge = work_dir / "bridge-timeout"
-        payload = run_plugin(harness, bridge, state, responses)
+        payload = run_plugin(harness, plugin_path, bridge, state, responses)
         result = payload.get("result", {})
         print(f"  插件结果：ok={result.get('ok')} written={result.get('written')} "
               f"source={result.get('source')} error_code={result.get('error_code')} "
@@ -509,6 +601,7 @@ def main() -> int:
                        f"actual={body.get('reason_code')}")
             checker.ok("choice 是 item", body.get("choice", {}).get("type") == "item",
                        f"actual={body.get('choice')}")
+        expect_plugin_status(checker, bridge, "timeout", "degraded")
 
     except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
         print(f"\n[ERROR] mock 执行失败：{exc}", file=sys.stderr)
