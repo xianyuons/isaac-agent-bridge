@@ -10,15 +10,15 @@
 
 | # | 缺陷 | 根因 | 修复 | 回归测试（修复后通过 / 修复前失败） |
 | --- | --- | --- | --- | --- |
-| D1 | **R1/R2 竞态**：R1 慢、R2 快时，R1 的旧结果最后写入，覆盖 R2 | `runIsaacDecide` 算完就直接 `writeDecisionAtomic`；没有“当前请求是否仍是最新”的判定 | 新增发布闸门 `registerRequest()` + `evaluatePublishGate()`：写锁内先比对进程内最新请求（`request_id` / `gen_level_key` / `ts`），文件模式下再读一次 `state.json` 复核；旧结果直接丢弃并返回 `discarded:true`，不覆盖 `decision.json` | `R1/R2 final request is R2`、`R1/R2 final item is R2 choice`、`R1/R2 old result discarded`、`R1/R2 old result not written`、`R1/R2 new result written` |
+| D1 | **R1/R2 竞态**：R1 慢、R2 快时，R1 的旧结果最后写入，覆盖 R2 | `runIsaacDecide` 算完就直接 `writeDecisionAtomic`；没有“当前请求是否仍是最新”的判定 | 新增发布闸门 `registerRequest()` + `evaluatePublishGate()`：写锁内比对最新请求（`request_id` / `gen_level_key` / `ts`）与**局面指纹**；旧结果在指纹不变时可绑定最新请求发布（§6.7 #3），新请求已有决策/指纹变/换层才丢弃 | `R1/R2 final request is R2`、`R1/R2 final item is R2 choice`、`R1/R2 old result discarded`、`R1/R2 old result not written`、`R1/R2 new result written`、`rebind result written`、`rebind result request`、`rebind decision request` |
 | D1a | 换层后旧层结果覆盖新层 | 同上；只按 `request_id` 判断不够 | 闸门同时比较 `gen_level_key`；不一致记 `level_changed`，拒绝写入 | `level change final key is K2`、`level change old discarded`、`level change old reason` |
-| D1b | mod 已写 R2 到 `state.json`，插件还没登记 R2，R1 仍会覆盖 | 只靠进程内登记不够 | 文件模式下写前重读 `state.json`；磁盘 `ts >= 本请求 ts` 且 `request_id`/`gen_level_key` 不同 → 丢弃 | `disk supersede discarded`、`disk supersede reason`、`disk supersede not written` |
-| D2 | **消费一次即作废**在插件侧不成立：同一 `request_id` 可以重复发布决策 | 没有发布记录 | 成功写盘后把 `request_id` 记入 `publishState.consumed`（TTL 10 分钟）；再次发布同 `request_id` 直接丢弃，`discard_reason = already_consumed` | `consume first written`、`consume second discarded`、`consume second reason`、`consume file keeps first choice` |
+| D1b | mod 已写 R2 到 `state.json`，插件还没登记 R2，R1 仍会覆盖 | 只靠进程内登记不够 | 文件模式下写前重读 `state.json`；磁盘 `ts >= 本请求 ts` 且请求不同 → 指纹不变则绑定磁盘最新请求发布，指纹变/换层才丢弃 | `disk rebind written`、`disk rebind result request`、`disk rebind decision request`、`fingerprint change discarded`、`fingerprint change reason` |
+| D2 | **发布≠消费**：t13 把 publish 当成 consume，禁止同一 `request_id` 再发 | 误读 §6.7；消费发生在 mod 侧（生成时），插件无法知道 | 撤销 `publishState.consumed`；去重只按 `decision_id`（同 id 忽略）；相同 `request_id`、不同 `decision_id` 允许（§6.7 #6）；消费仍由 mod 的 outstanding/applied 表达 | `same request first written`、`same request second allowed`、`same request second not discarded`、`same request new decision id`、`same request latest wins in file`、`duplicate decision ignored`、`duplicate decision reason` |
 | D3 | **路径校验后父目录被换成 junction（TOCTOU）**：校验通过 → 父目录被替换 → 实际写到白名单外 | `resolveBridgeDir` 只校验一次；后续用原路径 `mkdir`/`open`/`rename` | `ensureRealBridgeDir()`：每次写入前 `mkdir → realpath → 与白名单路径逐字比对`，junction/symlink 一律拒绝；用**真实目录**拼 tmp/dest；open 后 `realpath(tmp)` 再确认落在真实目录内；rename 前再次 `realpath(realDir)` 复核 | `junction write rejected`、`junction outside untouched`、`junction not reported as written`、`junction owner token untouched` |
-| D4 | **模型忽略 AbortSignal → validity 不是硬截止**：validity=600ms，模型 904ms 才返回，仍写过期 fallback | 只在调用前算预算，拿到响应后不再判有效期 | `publishDecision` 增加 `requireFresh`；`evaluatePublishGate` 在写锁内按 `state.ts + validity_ms` 硬判；模型成功/模型失败兜底都带 `requireFresh:true`，过期直接 `discarded/late`，不写盘 | `late model result discarded`、`late model result reason`、`late model result error`、`late model result reason_code`、`late model result not written`、`late model result leaves no decision` |
+| D4 | **模型忽视 AbortSignal → 调用悬挂**：只做到“迟到不写”，模型永不返回时调用方一直挂着 | 等待模型只用 AbortSignal/内部超时，没有与 validity 挂钩的外部硬截止 | `withDeadline()` 用 `Promise.race` 在 `deadlineAt`（`state.ts + validity_ms - 200ms`）硬切；到点立即走规则兜底（`source=rule, fallback=true, error_code=TIMEOUT`）并放弃等待；迟到结果即使后来到达也不落盘 | `late result returns before model resolves`、`late result fallback written/source/flag/error/reason_code`、`late result decision source/error`、`late result does not overwrite fallback`、`never-resolving model does not hang`、`never-resolving model returns near deadline`、`never-resolving fallback ...` |
 | D5 | **校验太松**：`requires` 未知能力、`pool=null`、池级候选 `pedestal_index` 非空都通过 | `requires`/`features` 只校验“数组/字符串”；`trigger.payload` 未校验 `pool`；候选一致性只挡“非空不相等”，没挡“池级应为 null / 指定底座应为同值” | 新增 `checkCapabilityList`：`requires` 未知 → `version_minor_feature`；`features` 仅形状校验；`trigger.payload.pool` 必须非空字符串；池级候选必须全 `null`，指定底座候选必须等于 `trigger.pedestal_index` | `unknown requires rejected`、`unknown requires reason`、`unknown requires publishes rejection`、`unknown requires rejection reason`、`unknown requires rejection written`、`known requires accepted`、`unknown features ignored`、`pool candidate must be null`、`null pool payload rejected`、`specific pedestal candidate must match`、`pedestal index range checked` |
 | D5b | **根节点不是对象时崩成 INTERNAL**：`state=null` → `Cannot read properties of null (reading 'request_id')` | `validateStateDoc(null)` 返回非 fatal，随后拒绝决策路径读 `state.request_id` | 非对象文档改为 `fatal('invalid_type')`；`runIsaacDecide` 直接返回 `written:false`，不进入拒绝决策路径 | `null root is fatal`、`null root reason`、`null root not written`、`null root not internal` |
-| D6 | **reason 超长仍发布**：280 个 emoji = 1120 字节，超过协议 1024 字节 | 只按 code point 截到 280 字符，没按 UTF-8 字节截断；`assertDecisionLegal` 也只查字符数 | `sanitizeReason` 同时按 `MAX_REASON_CHARS=280` 与 `MAX_REASON_BYTES=1024` 截断（不切断代理对）；`assertDecisionLegal` 增加字节上限校验 | `reason chars capped`、`reason bytes capped`、`reason not empty after truncation` |
+| D6 | **reason 超长仍发布**：280 个 emoji = 1120 字节，超过协议 1024 字节 | t13 错把“上限”当“可截断”；§1.6/§9 明确超限拒绝、不得截断 | `sanitizeReason` 只做单行化，不再截断；`normalizeDraft` 超限抛 `invalid_reason`，模型重试后走规则兜底；兜底句固定短句，不截断用户文本；`assertDecisionLegal` 仍校验字符+字节 | `overlong reason rejected`、`overlong reason fallback`、`overlong reason error`、`overlong reason code`、`overlong reason fallback source`、`overlong fallback reason chars/bytes` |
 
 ### D1 / D2 的时序（修复后）
 
@@ -193,6 +193,68 @@ npm --prefix plugin test
 
 ---
 
-## 7. t18 后续：draft.5 字段补齐
+## 7. t18/t19 后续：draft.5 字段补齐
 
-t18 在本分支基础上补齐 `decision.session_id` 回显与 `plugin_status.json`，测试扩到 **157 项**（原 111 + 46）。完整「已实现/未实现」清单见 [draft5-plugin-fields.md](draft5-plugin-fields.md)。本文件 §1 的 D1–D6 仍适用。
+t18 补齐 `decision.session_id` 回显与 `plugin_status.json`；t19 又修正了本文件 D2/D4/D6 的过度收紧。测试现为 **182 项**（原 111 + t18 46 + t19 25）。完整「已实现/未实现」清单见 [draft5-plugin-fields.md](draft5-plugin-fields.md)。本文件 §1 的 D1–D6 已按 §8 更新。
+
+---
+
+## 8. 对独立评审三条的处置与依据（t19）
+
+> 先核对 `docs/protocol.md`（1.0-draft.5）原文，再决定改代码还是反驳。
+
+### D2：发布 ≠ 消费（采纳，撤销 t13 的 consumed）
+
+**协议依据**：
+
+- §6.7 第 6 条：「相同 `decision_id` 重复到达 → 忽略；相同 `request_id`、不同 `decision_id` → 允许，按接收时间取最新。」
+- §6.7 第 5 条：消费发生在**生成时**（mod 侧）；「一次生成恰好消费一个 choice」由 mod 的 `outstanding` / `applied.json` 表达。
+- §6.7 第 3 条：「为 R1 算出的结果可以在 R2 到达后发布，但只能绑定到发布时最新的请求（R2），并使用新的 `decision_id`；若指纹已变，丢弃旧结果。」
+
+**处置**：
+
+1. 删除 `publishState.consumed`；发布成功不再等于消费。
+2. 去重只按 `decision_id`：同一 `decision_id` 再次发布 → `discarded/duplicate_decision`；相同 `request_id`、不同 `decision_id` → 允许。
+3. 旧结果若命中最新请求且局面指纹（§6.7 #2：`session_id`、`gen_level_key`、血量、角色、items id/count、candidates item_id）不变 → **绑定最新请求**发布（新 `decision_id` 保留）；若新请求已有决策 → 丢弃（避免更慢的旧结果盖掉新结果）；指纹变/换层 → 丢弃。
+4. 消费仍由 mod 侧 `outstanding` / `applied.json` 表达；插件不伪造消费回执。
+
+**测试**：`same request first/second allowed`、`same request new decision id`、`same request latest wins in file`、`duplicate decision ignored/reason`、`disk rebind written/result request/decision request`、`rebind result/decision request`、`fingerprint change discarded/reason`。
+
+### D4：硬截止（采纳，补 `Promise.race`）
+
+**协议依据**：§6.1 给插件落盘预算（`validity_ms - 200ms`），§6.2 要求 mod 永不阻塞；插件不能因为模型不响应而把调用挂住。
+
+**处置**：
+
+- `withDeadline(promise, deadlineAt)` 用 `Promise.race` 在 `state.ts + validity_ms - 200ms` 硬切；到点立即走规则兜底（`source=rule, fallback=true, error_code=TIMEOUT, reason_code=timeout`），并放弃等待。
+- 底层模型 promise 之后即使返回/拒绝，由 `Promise.race` 的处理器吸收，不再落盘；`publishedDecisionIds` 也不会记录它。
+- 兜底写入仍在 validity 窗口内（200ms 写盘余量），不会变成 `late`。
+
+**测试**：`late result returns before model resolves`（<650ms）、`late result fallback written/source/flag/error/reason_code`、`late result does not overwrite fallback`、`never-resolving model does not hang`、`never-resolving model returns near deadline`（<800ms）、`never-resolving fallback ...`、`never-resolving decision source/error`。
+
+### D6：reason 超限（采纳“拒绝”，撤销 t13 的截断）
+
+**协议依据**：
+
+- §1.6：「超限即 `VALIDATION` / `out_of_range`，**不得截断后继续**（截断会让两端对同一请求理解不一致）。」
+- §9：「大小上限：见 §1.6；**超限拒绝，不截断**。」
+- §3.6：`invalid_reason` 归类 `VALIDATION`。
+
+**处置**：
+
+- `sanitizeReason` 只做单行化/控制字符清理，**不截断**。
+- `normalizeDraft` 检查 280 字符 + 1024 UTF-8 字节；超限抛 `DraftError('invalid_reason')` → 模型重试一次，仍失败走规则兜底（`error_code=VALIDATION, reason_code=invalid_reason`）。
+- 内部兜底句固定短（`rule.reason；suffix`）；若未来异常超限，改用固定短句 `本地规则兜底`，**不截断用户/模型文本**。
+- 协议本身已明确“拒绝、不截断”，无需修改 protocol；t13 文档中“截断”的描述已在本文件 §1 修正。
+
+**测试**：`overlong reason rejected`、`overlong reason fallback`、`overlong reason error`、`overlong reason code`、`overlong reason fallback source`、`overlong fallback reason chars/bytes`。
+
+### 结果
+
+```text
+# t18 代码（3fcb2d3）跑 t19 测试
+137 passed, 45 failed
+
+# t19 代码
+182 passed, 0 failed
+```
