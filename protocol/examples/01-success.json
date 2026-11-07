@@ -24,6 +24,7 @@
   "files": {
     "event.json": {
       "protocol_version": "1.0",
+      "session_id": "s-2f9a-0001",
       "event_seq": 42,
       "ts": 1793982599980,
       "type": "boss_approach",
@@ -32,15 +33,15 @@
     },
     "state.json": {
       "protocol_version": "1.0",
+      "session_id": "s-2f9a-0001",
       "request_id": "r-7f3a-000042",
       "gen_level_key": "f2:r84:boss:p0:9c1e",
       "ts": 1793982600000,
       "validity_ms": 6000,
       "error_code": null,
       "reason_code": null,
-      "features": ["transport:file_write", "hook:pre_get_collectible", "apply:prefetch", "action:reroll"],
+      "features": ["transport:file_write", "transport:file_read", "hook:pre_get_collectible", "apply:prefetch", "action:reroll"],
       "requires": [],
-      "capabilities": ["transport:file_write", "transport:file_read", "hook:pre_get_collectible", "apply:prefetch", "action:reroll"],
       "trigger": {
         "type": "boss_approach",
         "event_seq": 42,
@@ -65,6 +66,7 @@
     },
     "decision.json": {
       "protocol_version": "1.0",
+      "session_id": "s-2f9a-0001",
       "request_id": "r-7f3a-000042",
       "decision_id": "d-9c1e-000001",
       "gen_level_key": "f2:r84:boss:p0:9c1e",
@@ -86,6 +88,7 @@
     },
     "applied.json": {
       "protocol_version": "1.0",
+      "session_id": "s-2f9a-0001",
       "request_id": "r-7f3a-000042",
       "gen_level_key": "f2:r84:boss:p0:9c1e",
       "ts": 1793982605002,

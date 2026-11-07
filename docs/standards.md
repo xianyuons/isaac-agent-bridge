@@ -1,7 +1,7 @@
 # 第一部分：代码规范
 
 ## 布局与命名
-- 使用`lua/`、`dsh/`、`python/`存放实现，各自内置`tests/`，使用`protocol/`存放协议及样例、`docs/`存放文档。
+- 游戏侧放`mods/<mod名>/`（游戏加载要求）；`dsh/`、`python/`存放实现，各自内置`tests/`；`protocol/`存放协议及样例，`docs/`存放文档。
 - 文件、Lua/Python变量及函数用`snake_case`，JS变量及函数用`camelCase`，常量用`UPPER_SNAKE_CASE`。
 
 ## Lua
