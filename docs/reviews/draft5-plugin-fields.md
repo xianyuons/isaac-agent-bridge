@@ -2,7 +2,7 @@
 
 > 依据：`docs/protocol.md` **1.0-draft.5**（t8 Claude 补审 + captain 产品取舍，commit `fb9e25c`）与 `docs/architecture.md` v1.0-draft.5。
 > 范围：**DSH 插件侧必须产出/回显的字段**。mod 侧产出（state/event/applied、`actual_item_id`、气泡）不在此表。
-> 分支：`agent/t18-draft5-fields`（基于 `agent/t13-plugin-defects` 并合入 t8 draft.5 文档）。测试：`plugin/tests/plugin.test.mjs`（156 项）。
+> 分支：`agent/t18-draft5-fields`（基于 `agent/t13-plugin-defects` 并合入 t8 draft.5 文档）。测试：`plugin/tests/plugin.test.mjs`（157 项）。
 
 ---
 
@@ -10,7 +10,7 @@
 
 - **已实现**：`decision.session_id` 回显、`plugin_status.json`（含任务要求的运行状态扩展）、draft.5 对 decision 的既有字段要求。
 - **未实现（已知）**：`bridge.lock`（因此 `plugin_status.x_runtime.lock_held` 恒为 `false`，只代表“本插件未持锁”）、按 `(session_id, gen_level_key)` 的缓存/指纹、`applied.json` 回读、viewer 倾向接入、读路径 TOCTOU、模型流完全不返回时的强制取消。
-- 测试：修复前（t13 代码）**117 passed / 39 failed**；修复后 **156 passed / 0 failed**。
+- 测试：修复前（t13 代码）**117 passed / 40 failed**；修复后 **157 passed / 0 failed**。
 
 ---
 
@@ -116,7 +116,7 @@ draft.5 §1.11 定义（插件写、mod/QA 读，可选诊断，不替代 `appli
 | 规则兜底（模型失败/超时/降级） | `degraded` | 兜底的 error_code / reason_code | 对应 +1 |
 | `valid:false` 拒绝决策 | `refused` | `VALIDATION` / 具体 reason | `VALIDATION` +1 |
 | 信封不可读（version major / 缺 session/request） | `refused` | `VALIDATION` / 具体 reason | `VALIDATION` +1 |
-| 读 state IO 失败 | `degraded` | `IO` / `io_error` | `IO` +1 |
+| 读 state（`isaac_state`）成功/失败 | 保持当前 status | 不变 | 不变（只读 state 不证明模型/决策链路健康，避免冲掉 degraded/refused） |
 | 迟到/被新请求取代而丢弃 | 保持当前 status | 不变 | 不变（不是插件故障） |
 | 后续成功 | `ready` | null | 历史计数保留 |
 
@@ -190,14 +190,14 @@ draft.5 §1.11 定义（插件写、mod/QA 读，可选诊断，不替代 `appli
 $ cmd /c "git show bfb0734:plugin/index.js > %TEMP%\isaac-t18-prefix.js"
 $ set PLUGIN_ENTRY=%TEMP%\isaac-t18-prefix.js
 $ node plugin/tests/plugin.test.mjs
-117 passed, 39 failed
+117 passed, 40 failed
 
 # 修复后
 $ node --check plugin/index.js      # exit 0
-$ node plugin/tests/plugin.test.mjs # 156 passed, 0 failed
+$ node plugin/tests/plugin.test.mjs # 157 passed, 0 failed
 ```
 
-39 条失败全部来自新增的 session_id / plugin_status 断言；原有 111 项仍全过。
+40 条失败全部来自新增的 session_id / plugin_status 断言；原有 111 项仍全过。
 
 ---
 
@@ -210,4 +210,4 @@ npm --prefix plugin test
 python tools/mock_e2e.py
 ```
 
-预期：`156 passed, 0 failed`；mock 4/4 场景 52/52 断言。
+预期：`157 passed, 0 failed`；mock 4/4 场景 52/52 断言。

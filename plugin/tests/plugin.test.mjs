@@ -779,6 +779,12 @@ async function withBridgeEnv(dir, fn) {
   eq('status degraded count', status.x_runtime.error_code_counts.MODEL, 1)
   eq('status degraded available', status.x_runtime.available, true)
 
+  // 只读 state 不应把降级状态冲成 ready。
+  await T.runIsaacState({ config: { bridgeDir } })
+  status = (await readJsonIfExists(path.join(bridgeDir, 'plugin_status.json')))
+    ?? { x_runtime: { error_code_counts: {} } }
+  eq('state read keeps degraded status', status.status, 'degraded')
+
   const recovered = freshState()
   recovered.request_id = 'r-status-recover-01'
   await T.runIsaacDecide({

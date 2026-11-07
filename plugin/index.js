@@ -1530,13 +1530,8 @@ async function runIsaacState({ config }) {
   const bridgeDir = await resolveBridgeDir(config).catch(() => null)
   const result = await runIsaacStateInner({ config })
   if (bridgeDir) statusState.bridgeDir = bridgeDir
-  if (result.ok) {
-    markStatusSuccess()
-  } else {
-    markStatusFailure(result.error_code, result.reason_code, {
-      refused: result.error_code === 'VALIDATION',
-    })
-  }
+  // 只读 state 不证明模型/决策链路健康：不在这里 markSuccess/Failure，
+  // 避免一次成功的读把之前的 degraded/refused 冲掉。
   await refreshPluginStatus(config, bridgeDir ?? statusState.bridgeDir)
   return result
 }
