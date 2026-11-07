@@ -19,6 +19,8 @@ isaac_agent — 游戏侧 Lua mod（依赖 REPENTOGON / Repentance+）
   ⚠ 实测约束：原版 REPENTOGON 沙箱不提供 io/os（参考实现亦只在 Mod:SaveData 上搭桥），
     因此 Profile A 目前需要 `--luadebug` 启动项，或等 REPENTOGON 暴露文件 API。
     桥目录由插件侧创建（mod 只探测、不调 shell、不建目录）。
+    桥目录里的 `.isaac_agent_owner` 是 mod 的所有者令牌：每次写入前后都会校验它，
+    插件侧 **不得删除或改写** 这个文件（否则 mod 会判定目录被替换并停止写入）。
     探针失败 **不会** 让游戏坏掉：退回本地规则，并在气泡/日志里说明。
   ⚠ Profile C（SaveData 中继）按协议 §1.4 属研究形态、默认关闭，本版不实现。
 
