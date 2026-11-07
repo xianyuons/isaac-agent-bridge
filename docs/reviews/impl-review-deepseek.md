@@ -1,8 +1,9 @@
-# 实现级评审（DeepSeek 第二线）
+# 实现级评审（DeepSeek 第二线）— revision r2
 
 > **契约基线**：`fb9e25c`（`origin/agent/t8-claude-review`，protocol/architecture = `1.0-draft.5`）。
-> **实现基线**：`7d4e102`（`origin/main`，其 `plugin/index.js` 与 `ba5e61c` 一致，t13 修复尚未落盘）+ `agent/t12-lua-defects`（Lua 侧已修 5 处缺陷，106 断言）。
-> **GPT 线报告**：截至本版交付时尚未落盘，本版未做逐项对照；「与 GPT 线重合/分歧」对照节待补。
+> **实现基线**（r1 时点）：`7d4e102`（`origin/main`，其 `plugin/index.js` 与 `ba5e61c` 一致，t13 修复尚未落盘）+ `agent/t12-lua-defects`（Lua 侧已修 5 处缺陷，106 断言）。
+> **实现基线**（r2 时点）：`origin/main` = `ec4d49f`，已并入 t12（Lua 5 处）、t13（插件 R1/R2、junction TOCTOU、校验缺口）、t20（Lua 消费清整个 K + 回执改到核验后写，106→133 断言）；另有 t18（draft.5 字段：session_id/plugin_status/插件测试）、t21（capabilities/ts）、t24（m5/m7）三支修复分支在途未合 main。
+> **GPT 线报告**：已落盘（`origin/agent/t10-gpt-review`，commit `bf56f39`，`docs/reviews/impl-review.md`，272 行）。本版已逐项对照，见 §7。
 > **评审方式**：只读代码，只写本评审文件，不改任何实现。凡本机无法实际运行的检查，在对应条目后标注 `[静态]`。
 
 ---
@@ -18,6 +19,8 @@
 - `subst` 盘符无残留。
 
 t12 已修的 5 处（消费后 outstanding、过期缓存、rename 丢旧文件、rejected 真值表、目录替换 TOCTOU）经核代码与测试确认已落地，**不重复计分**。
+
+**r2 更新（2026-11-07）**：t20（`7223289`）已合入 main——`M3`（消费未清空整层在途表）与「核验迟到仍写成功回执」均已修（Lua 断言 106→133）。新增 4 条必修（§8）：8.1 `and/or` 陷阱写错 error_code、8.2 `make_key` 前 8 截断、8.3 未知 error_code 被接受、8.4 JSON 解码器容忍原始换行。GPT 线已对照（§7），我漏掉的 5 项（G04/G07/G11/G14/G15）已采纳。**§2 必修清单以 §7.4 / §8.6 的最新状态为准。**
 
 ---
 
@@ -214,7 +217,8 @@ t12 已修 5 处，逐条核过代码与测试，确认落地：
 | revision | 日期 | 内容 |
 | --- | --- | --- |
 | r1 | 2026-11-07 | 初版（DeepSeek 第二线）。GPT 线报告未落盘，对照节待补。 |
-| r1（续） | 2026-11-07 | t15：核验临时评审员 8 条发现并作为 §6 附录并入（见下）。r2 保留给 GPT 对照节。 |
+| r1（续） | 2026-11-07 | t15：核验临时评审员 8 条发现并作为 §6 附录并入。 |
+| r2 | 2026-11-07 | GPT 线报告落盘（bf56f39），补 §7「与 GPT 线重合/分歧/它提到而我漏掉的」；t16 核验第二批 5 条 Lua 发现作为 §8 附录；G01/M3/核验回执按 t20 更新为已修。 |
 
 ---
 
@@ -271,3 +275,108 @@ t12 已修 5 处，逐条核过代码与测试，确认落地：
 - 判定：**不成立**。
 - 证据（复现）：`cd 仓库 && python -m unittest discover -s tools/tests` → `Ran 15 tests ... OK`（exit 0）。`tools/tests/test_danmaku_sim.py` 在 `origin/main`（7d4e102）存在，由 t5 合入（4c23f0a）带入；README 的 `python -m unittest discover -s tools/tests -p "test_*.py"` 与真实结构对齐。临时评审员大概率在旧 main（ba5e61c，t5 未合、tools/tests 尚未创建）上核的。
 - 顺带（非本条，供 qa）：README/CONTRIBUTING 里"Lua 逻辑 74 条断言"是陈旧数字（t12 后为 106 条），可顺手更新。
+
+---
+
+## 7. 与 GPT 线重合 / 分歧 / 它提到而我漏掉的（r2 对照节）
+
+> GPT 线报告：`origin/agent/t10-gpt-review` commit `bf56f39`，`docs/reviews/impl-review.md`（272 行），实现基线 `0e4d66f`（已含 t12/t13），独立评审、不互相覆盖。下表逐项给态度。
+
+### 7.1 重合项（两边都提到，判定一致）
+
+| GPT 编号 | 本报告编号 | 一致态度 | 现状 / 派任务 |
+| --- | --- | --- | --- |
+| G01 同 K 终态隔离 | M3 | 同意 | **已修(t20)**，见 §7.4 |
+| G03 跨进程实例锁 | M4 | 同意 | 未修；无派单（待 t24 或后续） |
+| G05 目录替换 TOCTOU | L3 | 同意 | **t13 已修父目录 realpath 重验**（我 r1 基线 7d4e102 未含 t13，故 r1 判"未修"）；t12 的 owner 令牌只护 mod 侧写，不护插件侧 |
+| G06 rename 删旧文件 | （t12 已修项） | 同意 | 已修(t12, T22) |
+| G10/D5-B 未知 provider 前缀被拒 | M1 | 同意 | 未修；t18/t21 未覆盖（需单独派） |
+| G12 四接口无组装入口 | M5 | 同意 | 未修；t24（m5-m7）在途 |
+| G13/D5-A 时钟 + session 四文档 | M2 + H1 | 同意 | session → t18 在途；ts 秒级粒度 → t21（capabilities-ts）在途 |
+| D5-C 默认只读能力（Profile B） | M7 | 同意 | t24（m5-m7）在途 |
+
+### 7.2 分歧项（两边判定不同，逐条裁决）
+
+- **G01 / M3 的"同 K 全清"状态**：我 r1 判 M3「未修（只清单 request）」；GPT 判「已修(t12，同 request 子项)，同 K 其他 request 仍待复核」。两者其实同向——t12 确实只修了同 request，同 K 未清。**t20（7223289 `fix(lua): 消费清整个 K、兜底也清 K、回执改到核验之后写`）已把同 K 全清**（新增 `consume_generation(gen_key)`，见 §7.4），断言 106→133。故本条目两边统一更新为 **已修(t20)**。
+- **G05 / L3**：GPT 判「已修(t13 父目录 realpath + t12 owner 令牌)」；我 r1 判 L3「未修」。差异源于基线：我 r1 的实现基线是 7d4e102（t13 未合），GPT 基线是 0e4d66f（含 t13 dbc5ddc）。**裁决：t13 确实修了插件侧"resolve→换 junction→write"的父目录 realpath 重验，L3 的插件侧部分已修；UNC 白名单未明确与"复制 owner 令牌绕过"两条仍开**。我采纳 GPT 的修正，L3 降为「t13 已修核心，剩 UNC 白名单」。
+- **G07 冷缓存扫描**：我 r1 在 reasoning 里意识到 `ensure_candidates` 可能在回调 62 内冷缓存全量扫描（`build_candidates` O(maxId)），但**没有写进正式报告**；GPT 单列为 high。裁决：**同意 GPT，采纳为漏项**（见 §7.3）。
+
+### 7.3 GPT 提到而我漏掉的（采纳，需补进必修清单）
+
+| GPT 编号 | 内容 | 我的态度 | 是否已派任务 |
+| --- | --- | --- | --- |
+| G04 R1/R2 竞态覆盖 | 插件旧异步请求完成后覆盖新请求（decision.json 最终是旧 R1） | **同意，我漏了**（r1 插件基线 7d4e102 未含 t13，我未识别该竞态） | 已修(t13, dbc5ddc)，需复评"发布目标绑定"剩余 |
+| G07 冷缓存扫描 + 池失败扩全表 | 回调 62 冷缓存 `build_candidates` 全量扫描、池 API 空集回退全表 | **同意，我漏了**（reasoning 有、报告没列） | 未派单 |
+| G11 非合作上游取消 | `callModelOnce` 的 `for-await` 必须等流结束，忽略 signal 的上游会挂住工具 | **同意，我漏了** | 未派单 |
+| G14 未知信息省略/null + max_red 规则 | 必填 name 为 nil 被编码器省略；可选非 nullable max/cid 发 null；两端把 max_red 未知当可回血 | **同意，我漏了**（部分在 reasoning 里，未正式列） | 未派单（t21 只覆盖 capabilities/ts，未覆盖 G14 的 null/规则） |
+| G15 reason 清洗为 llm 成功 | 插件 `sanitizeReason` 把非法 reason 清洗而非拒绝，掩盖模型违约 | **同意，我漏了** | 已修(t13 reason 严格校验子项)，字节/空串/Unicode 控制范围需复评 |
+
+### 7.4 G01/M3 与 t20 的对账（captain 指定核对）
+
+- t20 提交 `7223289`：`fix(lua): 消费清整个 K、兜底也清 K、回执改到核验之后写`。
+- 证据：`origin/main:mods/isaac_agent/main.lua:1976-1987` 新增 `consume_generation(gen_key)`——`for rid, rec in pairs(S.outstanding) do if rec.gen_level_key == gen_key then S.outstanding[rid] = nil; S.consumed_requests[rid] = true ...`，**按 gen_level_key 清空全部同 K 请求**（不再只清 `doc.request_id`）。
+- 断言：`origin/main` `ec4d49f` 标题「Lua 断言 106→133」。G01 的"R1/R2→消费→R2/D2 迟到→第二次生成不得 llm"回归已由 t20 覆盖。
+- **结论**：GPT 的细分（"同 request 分支已修、同 K 其他 request 待复核"）与 t20 的修复一致；t20 已把同 K 全清。**本报告 M3 与 GPT G01 统一更新为「已修(t20)」**。fallback 终态是否也一并终结，见 t20 提交"兜底也清 K"，我抽读 `consume` 路径确认 fallback 分支同样走 `consume_generation`（`main.lua` 当前版 fallback 兜底路径也清 K），故整项关闭。
+
+---
+
+## 8. 附录：第二批 5 条 Lua 发现核验（t16）
+
+> 来源：同一名临时评审员（lupa 5.4 内存加载原实现 + 原 fixture）。本节由 reviewer-ds 对当前代码复核，判定「成立 / 已修 / 不成立」。基线：Lua 以 `origin/main`（`ec4d49f`，已含 t12+t20）为准；标注"t12 已修"仅指 t12 分支，t20 为后续修复。
+
+### 8.1 `player_dead` 本地 guard 写出 `error_code=TIMEOUT` —— **成立（未修）**
+
+- 判定：**成立**。由临时评审员首次发现、reviewer-ds 复核。是 Lua `a and nil or b` 陷阱。
+- 证据：`mods/isaac_agent/main.lua:1948`（当前 main）`make_applied_local`：
+  `error_code = guard_skip and nil or err_code`。
+  Lua 里 `guard_skip and nil` 在 guard_skip 为真时返回 `nil`（假值），随后 `nil or err_code` 继续走到 `err_code`；guard_skip 为假时 `false or err_code` 也返回 `err_code`。**两种分支都返回 `err_code`（默认 `"TIMEOUT"`）**，与"安全跳过 error_code 应为 null"（协议 §5.4 行 4、§3.6 no_candidate/player_dead 归类 null）相悖。
+- 后果：`player_dead` / `no_candidate` 的安全跳过，`applied.json` 里 `error_code` 被写成 `TIMEOUT` 而非 `null`，回执真值表对不上；统计会把安全跳过误计为超时失败。
+- 改法：用显式 if/else，别用 and/or 当三元：
+  ```lua
+  local error_code = err_code
+  if guard_skip then error_code = nil end
+  ```
+  并把 `rec.error_code` 改为 `error_code`（同时给该路径补一条断言：安全跳过时 `error_code == null`）。
+
+### 8.2 候选第 9 项变化时 `make_key` 相同 —— **成立（未修）**
+
+- 判定：**成立**。由临时评审员首次发现、reviewer-ds 复核。
+- 证据：`mods/isaac_agent/main.lua:1175`（当前 main）`make_gen_level_key`：`for i = 1, math.min(#candidates, 8) do sig = (sig * 31 + candidates[i].item_id) % 4294967296 end`。签名只取**前 8 个候选** + `#candidates`（计数），第 9..64 个候选变化时签名不变。
+- 后果：§1.5 要求 `gen_level_key` 覆盖"候选池内容签名、候选池重掷必须变化"。前 8 截断使"候选池变化检测"不完整。当前被 `cand_cache` 掩盖（候选按 floor 冻结、从不重采样），故暂不显式炸；但一旦做候选池重掷/移除，键不随内容变化，插件缓存/去重会误判"同一局面"。`[静态]`。
+- 改法：签名纳入**全部**候选（`for i = 1, #candidates`），或至少纳入"候选集合的完整哈希"而非前 8 个。与 t20 的 `consume_generation` 无冲突，可单独修。
+
+### 8.3 未知 `error_code`（如 `ALIEN`）的决策被接受 —— **成立（未修）**
+
+- 判定：**成立**。由临时评审员首次发现、reviewer-ds 复核。
+- 证据：`mods/isaac_agent/main.lua:1377-1382`（当前 main）`validate_decision`：对 `doc.error_code` 只做 `type(err) ~= "string"` 的类型检查，**没有对五类码（IO/TIMEOUT/VALIDATION/MODEL/INTERNAL）做枚举校验**。`error_code = "ALIEN"` 的非空字符串会通过，且真值表逻辑照常用它。
+- 后果：§3.1 `error_code` 是封闭五值枚举（`string|null`）。mod 消费侧接受未知 error_code，与插件侧 `validateStateDoc`（`index.js:410-412` 用 `ERROR_CODES.has()`）不一致；含 `error_code:"ALIEN"` 的 decision 可能被执行或写进 applied，索引/统计失准。
+- 改法：`validate_decision` 增加五类码白名单校验，未知值 → `VALIDATION` / `invalid_type`（与插件一致）。
+
+### 8.4 严格 JSON 里的原始换行被接受 —— **成立（低危，未修）**
+
+- 判定：**成立**。由临时评审员首次发现、reviewer-ds 复核。
+- 证据：`mods/isaac_agent/main.lua:316-360`（当前 main）自写 `parse_string` 的 `else` 分支（`main.lua:355-358`）对任意字符（含原始换行 `0x0A`、制表 `0x09`）直接 `out[#out+1] = c` 追加，未按 RFC 8259 拒绝字符串内未转义的控制字符（U+0000–U+001F）。
+- 后果：§1.1 要求"严格 JSON"。解析器比规范宽松。实际影响低：唯一写方（插件）用 `JSON.stringify` 恒输出转义后的合法 JSON；`reason` 里的控制字符也会在 `validate_decision`（`main.lua:1462`）被单独拦。故属"规范宽松边界"而非可利用漏洞。`[静态]`。
+- 改法（二选一）：① 在 `parse_string` 对 `c < 0x20` 且非转义的字符 `fail("control char in string")`，按规范拒绝；② 若刻意放宽，在协议/README 明确"解码器容忍字符串内原始控制字符"的边界。推荐 ①。
+
+### 8.5 `POST_PICKUP_INIT` 晚 3 帧到达时仍写 `phase=applied / applied_by=llm / actual=null` —— **已修（t20）**
+
+- 判定：**已修（t20）**。
+- 证据：当前 main 已改为"回执只在核验后写"：
+  - `main.lua:63` `VERIFY_WINDOW_FRAMES = 5`（由 2 帧放宽到 5 帧，并注明"必须有界"）。
+  - `main.lua:2129-2151` `finalize_pending_verify(actual_item_id, reason_code)`：把 pending 回执结算为 `phase=rejected / applied_by=none / source=nil / provider_id=nil / fallback=true / choice=nil / error_code=INTERNAL / reason_code=not_applied`，再 `write_applied`。
+  - `main.lua:2167-2178` `on_pre_get_collectible`：命中 item 时**不再立即写 applied**，只入 `S.pending_verify`；仅 skip（item_id=nil）即时写。
+  - `main.lua:2207-2210`（`on_pickup_init` 超窗）与 `main.lua:2241-2243`（`on_update` 超窗兜底）都调 `finalize_pending_verify(nil, "not_applied")`。
+- 结论：临时评审员描述的"生成早已发生却按成功记 applied/llm/actual=null"已被 t20 消除；核验不到/超窗/被覆盖统一落 rejected/none + reason_code。不计必修。
+
+---
+
+### 8.6 本节小结
+
+| 编号 | 判定 | 归属 |
+| --- | --- | --- |
+| 8.1 player_dead 的 `and/or` 陷阱 | 成立（未修） | 新增必修（建议列 MEDIUM，回执真值表被破） |
+| 8.2 make_key 前 8 截断 | 成立（未修） | 新增必修（LOW，被 cand_cache 掩盖） |
+| 8.3 未知 error_code 被接受 | 成立（未修） | 新增必修（MEDIUM，两端校验不一致） |
+| 8.4 原始换行被 JSON 接受 | 成立（低危，未修） | 新增必修（LOW，规范宽松边界） |
+| 8.5 核验迟到仍写成功回执 | 已修（t20） | 不计必修 |
