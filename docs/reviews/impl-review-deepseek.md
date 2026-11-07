@@ -219,6 +219,7 @@ t12 已修 5 处，逐条核过代码与测试，确认落地：
 | r1 | 2026-11-07 | 初版（DeepSeek 第二线）。GPT 线报告未落盘，对照节待补。 |
 | r1（续） | 2026-11-07 | t15：核验临时评审员 8 条发现并作为 §6 附录并入。 |
 | r2 | 2026-11-07 | GPT 线报告落盘（bf56f39），补 §7「与 GPT 线重合/分歧/它提到而我漏掉的」；t16 核验第二批 5 条 Lua 发现作为 §8 附录；G01/M3/核验回执按 t20 更新为已修。 |
+| r2（续） | 2026-11-07 | t17：核验第三批 2 条（必填 name 省略、快照失败伪装）作为 §9 附录；两两条均归 GPT G14 子项。 |
 
 ---
 
@@ -380,3 +381,33 @@ t12 已修 5 处，逐条核过代码与测试，确认落地：
 | 8.3 未知 error_code 被接受 | 成立（未修） | 新增必修（MEDIUM，两端校验不一致） |
 | 8.4 原始换行被 JSON 接受 | 成立（低危，未修） | 新增必修（LOW，规范宽松边界） |
 | 8.5 核验迟到仍写成功回执 | 已修（t20） | 不计必修 |
+
+---
+
+## 9. 附录：第三批 2 条发现核验（t17）
+
+> 来源：同一位临时评审员（lupa 5.4 内存加载原实现 + 原 fixture）。本节由 reviewer-ds 对当前代码复核。基线：Lua 以 `origin/main`（`ec4d49f`，含 t12+t13+t20）为准。两条均与 GPT G14（§7.3 我漏掉的）同源，此处补齐 file:line 证据。
+
+### 9.1 必填字段被静默省略（`name` 键整个消失） —— **成立（未修）**
+
+- 判定：**成立**。由临时评审员首次发现、reviewer-ds 复核。
+- 根因：不是编码器主动跳过，是 **Lua 语义吞 nil 键**——`{ name = nil }` 在 Lua 里根本不存 `name` 键，`json_encode` 的 `encode_table` 用 `pairs(v)` 遍历时看不到它，于是 `name` 被整体省略。
+- 证据：`mods/isaac_agent/main.lua:912-926` `item_name(id)` 在取不到配置/名称为空时 `return nil`（**返回裸 nil，不是 `JSON_NULL`**）；调用点 `main.lua:1116`（candidates）与 `main.lua:1196`（items）写成 `name = item_name(id)`。协议 §2.3 / §2.6 `name` 是**必填（可 null）**。
+- 后果：下游拿到"结构合法但缺必填字段"的 state；插件 `validateStateDoc` 对 `item.name !== null && !isNonEmptyString` 会放过 `undefined`（`name` 键缺失即 `undefined`），从而"缺必填"被当合法，索引/展示/统计拿到空 name。
+- 改法（二选一，推荐①）：① 调用点写 `name = item_name(id) or JSON_NULL`（与 `main.lua:1211` `boss.name = JSON_NULL` 一致，必填可 null 显式落 `null`）；② 在 `json_encode` 里对"必需但 nil 的键"主动拒绝并降级（代价大，不推荐）。另在测试补一条：`CONFIG[id].Name = nil` 时 `state.items[].name` 必须是 `null`（键存在）。
+
+### 9.2 快照失败被伪装成正常（`GetHearts` 抛错 → `red_hearts=0` + `error_code=null`） —— **成立（未修）**
+
+- 判定：**成立**。由临时评审员首次发现、reviewer-ds 复核。这是最危险的一类——不是崩，是静默给错数据。
+- 证据：`mods/isaac_agent/main.lua:842-846` `read_player` 的 `num(fn, default)` 用 `pcall(fn)` 包住，失败 `return default`；`main.lua:849` `snap.red_hearts = clamp_int(num(function() return p:GetHearts() end, 0), 0, 24, 0)`——`GetHearts` 抛错时静默得 `0`。`main.lua:1230` `build_state_doc` 恒写 `error_code = JSON_NULL`，无任何"本字段读取失败"的标记；`snap.ok`（`main.lua:835`）只表示"玩家对象是否取到"，不覆盖单字段读失败。
+- 后果：取不到血量被写成"血量 0"，`error_code=null` 让插件照常走 LLM——LLM 基于"0 血"可能错误地优先回血，而玩家实际满血。`[静态]`（`GetHearts` 抛错需注入桩复现，本机未起游戏；代码路径确定性成立）。
+- 改法：`read_player` 逐字段记录读失败（如 `snap.fail = snap.fail or {}; snap.fail.red_hearts = true`）；`build_state_doc` 检测到任一读失败 → 要么整份 state 不写并写 `applied`/日志，要么 `error_code = "INTERNAL"` + `reason_code = "state_invalid"`（协议 §6.4 局面降级，插件**不得**调 LLM）。绝不能把失败当默认值、`error_code` 仍为 null 交给 agent。测试补：`GetHearts` 抛错时 `state.error_code ~= null` 或 state 不落盘。
+
+---
+
+### 9.3 本节小结
+
+| 编号 | 判定 | 归属 |
+| --- | --- | --- |
+| 9.1 必填 name 被静默省略 | 成立（未修） | 新增必修（MEDIUM，= GPT G14 子项） |
+| 9.2 快照失败伪装正常 | 成立（未修） | 新增必修（MEDIUM 偏上，静默错数据） |
