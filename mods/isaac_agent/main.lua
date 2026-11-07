@@ -57,6 +57,10 @@ local ITEMS_CACHE_MS      = 1000     -- 已持有道具快照的缓存时长
 local BUBBLE_HOLD_MS      = 6000
 local LOG_RATE_MS         = 5000     -- 同类错误限频（协议 §6.6）
 local MAX_REFRESHES       = 8        -- 同一 gen_level_key 的刷新上限（≈ 8×validity/2）
+-- 底座核验窗口（帧）：POST_PICKUP_INIT 必须在这个窗口内出现，否则回执结算为 rejected。
+-- 参考实现用 ±2 帧配对；这里放宽到 5 帧（62 与 pickup init 之间可能隔一帧加载），
+-- 但仍然必须有界，不能让“未核验”的成功回执一直挂着。
+local VERIFY_WINDOW_FRAMES = 5
 local DECISION_SEEN_KEEP  = 16
 
 local BRIDGE_DIR_ENV      = "ISAAC_AGENT_DIR"
@@ -1965,6 +1969,27 @@ local function decision_is_fresh(d, t)
     return (t - out.sent_ms) <= (out.validity or S.validity_ms)
 end
 
+-- 生成发生：按 gen_level_key 清空**整个 K** 的未决项（协议 §6.7.1「生成发生后立即清空
+-- 该 K 的未决项」、§6.7.5「消费后该 K 的其余决策全部作废」）。
+-- 只清 doc.request_id 是不够的：同 K 的刷新请求 R2/R3 仍在表里，它们迟到的决策会被
+-- 当成有效决策接受，下一次生成又记成 llm。
+local function consume_generation(gen_key)
+    local cleared = 0
+    for rid, rec in pairs(S.outstanding) do
+        if rec.gen_level_key == gen_key then
+            S.outstanding[rid] = nil
+            S.consumed_requests[rid] = true
+            S.consumed_n = (S.consumed_n or 0) + 1
+            cleared = cleared + 1
+        end
+    end
+    S.outstanding_n = math.max(0, (S.outstanding_n or 0) - cleared)
+    if S.consumed_n > 512 then
+        S.consumed_requests, S.consumed_n = {}, 0
+    end
+    return cleared
+end
+
 -- 生成当帧：优先用内存里的新鲜决策，否则本地规则（协议 §6.2）
 local function consume(pool_name, gen_key, candidates)
     local t = now_ms()
@@ -1981,17 +2006,8 @@ local function consume(pool_name, gen_key, candidates)
                 item_id = doc.decision.choice.item_id
             end
 
-            -- 消费一次即作废（协议 §6.7.5）：
-            --   ① 该 request 立刻移出在途表；② 记住它已消费 → 迟到决策按 late 拒绝。
-            -- 不这么做的话，同一 request 的新 decision_id 会继续被接受，
-            -- 下一次生成又记成 llm（重复消费 / 归属错）。
-            S.outstanding[doc.request_id] = nil
-            S.outstanding_n = math.max(0, (S.outstanding_n or 0) - 1)
-            S.consumed_requests[doc.request_id] = true
-            S.consumed_n = (S.consumed_n or 0) + 1
-            if S.consumed_n > 256 then
-                S.consumed_requests, S.consumed_n = {}, 0
-            end
+            -- 消费一次即作废（协议 §6.7.5）：清空整个 K 的未决项，而不只是这一条请求。
+            consume_generation(gen_key)
             S.decision = nil
             if S.current ~= nil then S.current.refreshes = 0 end
             S.stats.draws = S.stats.draws + 1
@@ -2013,6 +2029,10 @@ local function consume(pool_name, gen_key, candidates)
         held_tags = held_tags,
     })
     local rec = make_applied_local(rule, gen_key, S.ped_index)
+    -- 兜底同样是一次“生成”：也必须清空该 K 的未决项（协议 §6.7.1），
+    -- 否则刷新请求的决策会在兜底之后继续被接受。
+    consume_generation(gen_key)
+    S.decision = nil
     S.stats.draws = S.stats.draws + 1
     S.stats.fallback = S.stats.fallback + 1
     if rule.choice.type == "item" then
@@ -2104,6 +2124,32 @@ local function on_new_room()
 end
 
 -- 回调 62：池抽取完成、底座生成之前
+-- 未核验回执的结算：核验失败 / 超窗 / 被新的生成覆盖时，按协议 §5.4 行 3 写 rejected。
+-- 关键不变量：**核验通过之前绝不写“成功”回执**；结算时 applied_by 只能是 none。
+local function finalize_pending_verify(actual_item_id, reason_code)
+    local pv = S.pending_verify
+    if pv == nil then return end
+    S.pending_verify = nil
+
+    local rec = pv.applied
+    rec.phase = "rejected"
+    rec.applied_by = "none"
+    rec.source = nil
+    rec.provider_id = nil
+    rec.fallback = true
+    rec.choice = nil
+    rec.error_code = "INTERNAL"
+    rec.reason_code = reason_code or "not_applied"
+    rec.actual_item_id = actual_item_id
+    write_applied(rec)
+
+    log_limited("warn", "verify", "verify_" .. tostring(rec.reason_code),
+        string.format("回执结算为 rejected：期望 %s，实际 %s",
+            tostring(pv.item_id), tostring(actual_item_id)),
+        { request_id = rec.request_id, decision_id = rec.decision_id,
+          error_code = "INTERNAL", reason_code = rec.reason_code })
+end
+
 local function on_pre_get_collectible(_, pool, decrease, seed)
     local pool_id = tonumber(pool) or 0
     local pool_name = pool_name_of(pool_id)
@@ -2118,8 +2164,12 @@ local function on_pre_get_collectible(_, pool, decrease, seed)
 
     if applied ~= nil then
         applied.pedestal_index = ped
-        write_applied(applied)
         if item_id ~= nil then
+            -- 回执只在核验通过后写（协议 §5.4：applied 记的是“实际生成”）。
+            -- 先把上一条还没核验的结算掉，免得它永远停在“待核验”。
+            if S.pending_verify ~= nil then
+                finalize_pending_verify(nil, "not_applied")
+            end
             S.pending_verify = {
                 item_id = item_id,
                 applied = applied,
@@ -2127,11 +2177,12 @@ local function on_pre_get_collectible(_, pool, decrease, seed)
                 gen_key = gen_key,
             }
             log("info", "draw", string.format(
-                "pool=%s ped=%d → 返回 %d（%s）",
+                "pool=%s ped=%d → 返回 %d（%s，待核验）",
                 pool_name, ped, item_id, tostring(applied.applied_by)),
                 { request_id = applied.request_id, decision_id = applied.decision_id })
         else
-            S.pending_verify = nil
+            -- skip：没有道具要核验，直接写（协议 §5.4 行 4）
+            write_applied(applied)
             log("info", "draw", string.format(
                 "pool=%s ped=%d → 保持原版（%s/%s）",
                 pool_name, ped, tostring(applied.error_code), tostring(applied.reason_code)),
@@ -2153,8 +2204,9 @@ local function on_pickup_init(_, pickup)
     local pv = S.pending_verify
     if pv == nil then return end
     local cur = frame()
-    if (cur - pv.frame) > 2 then
-        S.pending_verify = nil
+    if (cur - pv.frame) > VERIFY_WINDOW_FRAMES then
+        -- 超窗：此前没有任何成功回执，现在结算成 rejected/none，绝不冒充成功
+        finalize_pending_verify(sub, "not_applied")
         return
     end
 
@@ -2172,32 +2224,23 @@ local function on_pickup_init(_, pickup)
         log("info", "verify", string.format("核验通过：%d（decision=%s）",
             sub, tostring(pv.applied.decision_id)),
             { request_id = pv.applied.request_id, decision_id = pv.applied.decision_id })
+        S.pending_verify = nil
     else
-        -- 决策没真正生效（别的来源覆盖 / 未生成）
-        -- 协议 §5.4 行 3：rejected ⇒ applied_by=none、choice=null、source=null、
-        -- provider_id=null、fallback=true。保留 llm/item/fallback=false 会让回执自相矛盾。
-        pv.applied.phase = "rejected"
-        pv.applied.applied_by = "none"
-        pv.applied.source = nil
-        pv.applied.provider_id = nil
-        pv.applied.fallback = true
-        pv.applied.choice = nil
-        pv.applied.error_code = "INTERNAL"
-        pv.applied.reason_code = "not_applied"
-        pv.applied.actual_item_id = sub
-        write_applied(pv.applied)
+        -- 决策没真正生效（别的来源覆盖 / 未生成）：协议 §5.4 行 3 的 rejected 组合
+        finalize_pending_verify(sub, "not_applied")
         show_bubble("[兜底] 决策未生效（实际 " .. tostring(sub) .. "）",
             "[RULE] not_applied", true)
-        log_limited("warn", "verify", "not_applied",
-            string.format("返回 %s，实际生成 %s", tostring(pv.item_id), tostring(sub)),
-            { request_id = pv.applied.request_id, error_code = "INTERNAL", reason_code = "not_applied" })
     end
-    S.pending_verify = nil
 end
 
 local function on_update()
     -- 回调期间排队的文档每帧落盘（无排队时是 3 次 nil 判断）
     flush_writes()
+
+    -- 未核验的回执超窗必须结算：否则它要么永远挂着，要么（旧实现）已经以“成功”写出去过
+    if S.pending_verify ~= nil and (frame() - S.pending_verify.frame) > VERIFY_WINDOW_FRAMES then
+        finalize_pending_verify(nil, "not_applied")
+    end
 
     S.poll_counter = S.poll_counter + 1
     if S.poll_counter < POLL_EVERY_FRAMES then return end

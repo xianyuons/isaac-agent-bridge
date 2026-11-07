@@ -28,6 +28,9 @@ tests/lua_logic_test.lua — isaac_agent 离线逻辑测试
   T22 rename 失败保留旧 state（不删旧文件、不残留 tmp/.bak）
   T23 rejected 回执真值表（choice/source/provider_id=null、fallback=true、applied_by=none）
   T24 桥目录在探测后被替换（TOCTOU）→ 拒绝写入并降级
+  T25 消费清整个 K（R1→R2→生成，R2 迟到按 late 丢弃）
+  T26 兜底生成同样清整个 K（之后同 K 的决策不得再被接受）
+  T27 回执只在核验通过后写；超窗结算为 rejected/applied_by=none
 
 运行：
   lua tests/lua_logic_test.lua
@@ -241,6 +244,13 @@ local BRIDGE_DIR = TEMP .. "\\isaac_agent_test_" .. tostring(os.time()) ..
 sh('mkdir "' .. BRIDGE_DIR .. '" 2>nul')
 local function bpath(name) return BRIDGE_DIR .. "\\" .. name end
 
+-- 每个用例从干净的桥目录开始（否则上一条用例的 applied.json 会被误读）
+local function clear_bridge_files()
+    for _, name in ipairs({ "state.json", "event.json", "applied.json", "decision.json" }) do
+        os.remove(bpath(name))
+    end
+end
+
 -- 残留的 *.tmp.* 文件（原子写必须清理）
 local function tmp_files()
     local out = {}
@@ -270,6 +280,7 @@ local function reset_world()
     T.reset()
     T.S.boot = "t0001"
     T.S.tag_table = T.S.tag_table or {}
+    clear_bridge_files()
     T.detect({ dir = BRIDGE_DIR })
 end
 
@@ -387,6 +398,8 @@ do
     check(T.S.decision ~= nil, "应接受合法决策")
     local got = draw(0)
     eq(got, cand, "回调 62 应返回决策 id")
+    check(read_file(bpath("applied.json")) == nil, "核验前不得写成功回执")
+    pickup(cand)                                  -- 核验通过后才写 applied
     local applied = read_applied()
     check(applied ~= nil, "applied.json 应存在")
     if applied ~= nil then
@@ -432,6 +445,7 @@ do
     eq(T.S.rejected.reason_code, "invalid_id", "拒绝原因")
     local got = draw(0)
     check(got ~= nil, "应走本地规则并返回候选")
+    pickup(got)
     local applied = read_applied()
     eq(applied.applied_by, "fallback", "兜底 applied_by")
     eq(applied.reason_code, "invalid_id", "兜底 reason_code 取最后被拒原因")
@@ -459,6 +473,7 @@ do
     clear_decision()
     local got = draw(0)
     check(got ~= nil, "超时应走本地规则（仍有候选）")
+    pickup(got)
     local applied = read_applied()
     eq(applied.error_code, "TIMEOUT", "超时 error_code")
     eq(applied.reason_code, "no_fresh_decision", "超时 reason_code")
@@ -550,6 +565,7 @@ do
     eq(T.S.rejected.reason_code, "model_error", "保留对端 reason_code")
     local got = draw(0)
     check(got ~= nil, "不得执行其 skip，应走本地规则")
+    pickup(got)
     local applied = read_applied()
     eq(applied.applied_by, "fallback", "本地规则 applied_by")
 end
@@ -568,6 +584,7 @@ do
     check(got ~= nil, "应返回 heal 候选")
     local heal = { [15] = true, [16] = true, [22] = true, [23] = true, [24] = true, [25] = true, [26] = true, [45] = true }
     check(heal[got] == true, "应命中 heal 标签候选（实际=" .. tostring(got) .. "）")
+    pickup(got)
     local applied = read_applied()
     contains(applied.reason, "红心", "理由应说明补红心")
 end
@@ -649,8 +666,15 @@ do
     callbacks[62](nil, 0, false, 1)          -- 故意不 flush
     check(read_file(bpath("applied.json")) == nil, "回调 62 内不得写 applied.json")
     check(read_file(bpath("state.json")) == nil, "回调 62 内不得写 state.json")
+
+    T.request_state("room_enter", "treasure")   -- 也只是入队，不是写盘
+    check(read_file(bpath("state.json")) == nil, "request_state 不得立刻写盘")
     T.flush_writes()
-    check(read_file(bpath("applied.json")) ~= nil, "状态机 tick 落盘后 applied.json 才出现")
+    check(read_file(bpath("state.json")) ~= nil, "状态机 tick 落盘后 state.json 才出现")
+    check(read_file(bpath("applied.json")) == nil, "回执要等核验通过才写，不能随 flush 出现")
+    local pv = T.S.pending_verify
+    pickup(pv and pv.item_id)
+    check(read_file(bpath("applied.json")) ~= nil, "核验通过后 applied.json 才落盘")
 end
 
 -- ============================================================
@@ -718,6 +742,9 @@ do
     eq(T.S.rejected and T.S.rejected.reason_code, "late", "应按 late 拒绝")
 
     draw(0)
+    local got2 = T.S.pending_verify and T.S.pending_verify.item_id
+    check(got2 ~= nil, "第二次生成应走本地规则并返回候选")
+    pickup(got2)
     local applied = read_applied()
     eq(applied.applied_by, "fallback", "第二次生成必须是兜底，不得复用已消费请求")
     eq(applied.source, "rule", "兜底 source 必须是 rule")
@@ -833,6 +860,93 @@ do
     os.rename(moved, BRIDGE_DIR)
     T.detect({ dir = BRIDGE_DIR })
     eq(T.S.profile, "A", "恢复后应重新回到 Profile A")
+end
+
+-- ============================================================
+-- T25 消费要清整个 K：R1 → R2 → 生成，R2 的迟到决策必须被丢弃
+--     （协议 §6.7.1「生成发生后立即清空该 K 的未决项」/ §6.7.5「消费后该 K 的其余决策全部作废」）
+-- ============================================================
+do
+    section("T25 消费清整个 K")
+    reset_world()
+    local rid1, key = begin_request()                        -- R1
+    local rid2 = T.request_state("room_enter", "treasure")   -- R2（同 K，新 request_id）
+    T.flush_writes()
+    check(rid1 ~= rid2, "刷新请求必须有新的 request_id")
+    check(T.S.current.gen_level_key == key, "R2 的 gen_level_key 应保持不变")
+    check(T.S.outstanding[rid2] ~= nil, "R2 应在途")
+
+    local item1 = T.S.current.candidates[1].item_id
+    local item2 = T.S.current.candidates[2].item_id
+    publish(decision_doc(rid1, key, { type = "item", item_id = item1 }))
+    T.poll_decision()
+    check(T.S.decision ~= nil, "R1 的决策应被接受")
+
+    local got = draw(0)
+    eq(got, item1, "生成应消费 R1 的决策")
+    check(T.S.outstanding[rid2] == nil, "消费时必须一并清掉同 K 的 R2")
+    local consumed = T.S.consumed_requests
+    check(consumed ~= nil and consumed[rid2] == true, "R2 也必须记入已消费集合")
+
+    -- R2 的决策迟到：必须丢弃，不能留给下一次生成
+    publish(decision_doc(rid2, key, { type = "item", item_id = item2 }))
+    T.poll_decision()
+    check(T.S.decision == nil, "R2 的迟到决策不得被接受")
+    eq(T.S.rejected and T.S.rejected.reason_code, "late", "应判 late")
+end
+
+-- ============================================================
+-- T26 兜底生成同样是一次“生成”：也必须清空该 K 的未决项
+-- ============================================================
+do
+    section("T26 兜底也清 K")
+    reset_world()
+    local rid1, key = begin_request()
+    local rid2 = T.request_state("room_enter", "treasure")
+    T.flush_writes()
+    clear_decision()
+    local got = draw(0)                                       -- 无决策 → 本地规则
+    check(got ~= nil, "无决策时应走本地规则并返回候选")
+    check(T.S.outstanding[rid1] == nil, "兜底后 R1 必须清掉")
+    check(T.S.outstanding[rid2] == nil, "兜底后 R2 必须清掉")
+
+    publish(decision_doc(rid1, key, { type = "item", item_id = T.S.current.candidates[1].item_id }))
+    T.poll_decision()
+    check(T.S.decision == nil, "兜底之后同 K 的决策不得再被接受")
+    eq(T.S.rejected and T.S.rejected.reason_code, "late", "应判 late")
+end
+
+-- ============================================================
+-- T27 回执只在核验通过后写；失败/超窗必须 rejected + applied_by=none
+-- ============================================================
+do
+    section("T27 回执只在核验后写")
+    reset_world()
+    local rid, key = begin_request()
+    local cand = T.S.current.candidates[1].item_id
+    publish(decision_doc(rid, key, { type = "item", item_id = cand }))
+    T.poll_decision()
+    draw(0)
+    check(read_file(bpath("applied.json")) == nil, "核验前不得写出成功回执")
+
+    -- 不调 pickup，直接把帧推过核验窗口
+    world.frame = world.frame + 10
+    M.hooks.on_update()
+    T.flush_writes()
+    local applied = read_applied()
+    check(applied ~= nil, "超窗后应结算一条回执")
+    if applied ~= nil then
+        eq(applied.phase, "rejected", "超窗 phase 必须是 rejected")
+        eq(applied.applied_by, "none", "超窗 applied_by 必须是 none")
+        check(applied.choice == T.JSON_NULL, "rejected 的 choice 必须为 null")
+        check(applied.source == T.JSON_NULL, "rejected 的 source 必须为 null")
+        eq(applied.reason_code, "not_applied", "reason_code")
+    end
+
+    -- 迟到的核验不得把已经结算的 rejected 改写回成功
+    pickup(cand)
+    local after = read_applied()
+    eq(after.applied_by, "none", "超窗后的迟到核验不得改写为成功")
 end
 
 -- ============================================================
