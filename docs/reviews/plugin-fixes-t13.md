@@ -218,7 +218,7 @@ t18 补齐 `decision.session_id` 回显与 `plugin_status.json`；t19 又修正�
 3. 旧结果若命中最新请求且局面指纹（§6.7 #2：`session_id`、`gen_level_key`、血量、角色、items id/count、candidates item_id）不变 → **绑定最新请求**发布（新 `decision_id` 保留）；若新请求已有决策 → 丢弃（避免更慢的旧结果盖掉新结果）；指纹变/换层 → 丢弃。
 4. 消费仍由 mod 侧 `outstanding` / `applied.json` 表达；插件不伪造消费回执。
 
-**测试**：`same request first/second allowed`、`same request new decision id`、`same request latest wins in file`、`duplicate decision ignored/reason`、`disk rebind written/result request/decision request`、`rebind result/decision request`、`fingerprint change discarded/reason`。
+**测试**：`same request first written`、`same request second allowed`、`same request second not discarded`、`same request new decision id`、`same request latest wins in file`、`duplicate decision first written`、`duplicate decision ignored`、`duplicate decision reason`、`disk rebind written/result request/decision request`、`rebind result/decision request`、`fingerprint change discarded/reason`。
 
 ### D4：硬截止（采纳，补 `Promise.race`）
 
