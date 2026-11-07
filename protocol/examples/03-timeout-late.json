@@ -1,0 +1,125 @@
+{
+  "example": "03-timeout-late",
+  "summary": "生成时仍无决策（插件/模型未在有效期内响应）；mod 用本地规则 v1 兜底，结果与已生成的原版道具一致，无需 Morph。迟到决策在生成后到达，被丢弃，不改变已执行结果。",
+  "assumptions": {
+    "profile": "A",
+    "mode": "reactive（底座已生成，回调 62 返回 nil）",
+    "validity_ms": 1500,
+    "generation_at_ms": -30,
+    "fallback_at_ms": 1400,
+    "late_received_at_ms": 1810,
+    "expected_rule": "§6.5 R4：已持有道具无 damage 标签，候选有 damage -> 取 pedestal_index 最小的 damage 候选"
+  },
+  "timeline": [
+    { "t_ms": -30, "actor": "mod", "action": "写 event.json（pedestal_spawn, seq=61）；底座生成 4，回调 62 无决策返回 nil" },
+    { "t_ms": 0, "actor": "mod", "action": "写 state.json（request_id=r-7f3a-000061, validity_ms=1500）" },
+    { "t_ms": 50, "actor": "plugin", "action": "读到 state，开始 llm（内部超时 1100ms）" },
+    { "t_ms": 1150, "actor": "plugin", "action": "llm 仍在跑；插件未来得及在该请求上降级写盘（示例故意模拟插件侧卡顿）" },
+    { "t_ms": 1400, "actor": "mod", "action": "无 eligible 决策 -> 本地规则 R4 选 4；与已生成的 4 相同，无需 Morph" },
+    { "t_ms": 1402, "actor": "mod", "action": "写 applied.json（applied_by=fallback, error_code=TIMEOUT, reason_code=no_fresh_decision）" },
+    { "t_ms": 1420, "actor": "mod", "action": "气泡显示 [兜底] 本地规则：缺少输出，优先输出类" },
+    { "t_ms": 1780, "actor": "agent", "action": "llm 返回 draft：item_id=2" },
+    { "t_ms": 1800, "actor": "plugin", "action": "写 decision.json（valid=true, choice.item_id=2）" },
+    { "t_ms": 1810, "actor": "mod", "action": "读到决策但生成/兜底已结束 -> 丢弃；reason_code=late；applied.json 不变" }
+  ],
+  "files": {
+    "event.json": {
+      "protocol_version": "1.0",
+      "event_seq": 61,
+      "ts": 1793982719970,
+      "type": "pedestal_spawn",
+      "request_id": "r-7f3a-000061",
+      "payload": {
+        "pedestal_index": 0,
+        "item_id": 4,
+        "item_name": "Cricket's Head",
+        "room_type": "treasure"
+      }
+    },
+    "state.json": {
+      "protocol_version": "1.0",
+      "request_id": "r-7f3a-000061",
+      "gen_level_key": "f4:r52:treasure:p0:1b2c",
+      "ts": 1793982720000,
+      "validity_ms": 1500,
+      "error_code": null,
+      "features": ["transport:file_write", "hook:pre_get_collectible", "apply:prefetch"],
+      "requires": [],
+      "capabilities": ["transport:file_write", "transport:file_read", "hook:pre_get_collectible", "apply:prefetch"],
+      "trigger": {
+        "type": "pedestal_spawn",
+        "event_seq": 61,
+        "pedestal_index": 0,
+        "payload": { "item_id": 4, "pool": "treasure" }
+      },
+      "state": {
+        "player": { "red_hearts": 6, "soul_hearts": 0, "is_dead": false },
+        "items": [
+          { "id": 1, "name": "Sad Onion", "tags": ["tear"], "count": 1 }
+        ],
+        "room": { "type": "treasure", "is_boss_room": false, "grid_index": 52, "is_clear": true },
+        "floor": 4,
+        "boss": null,
+        "candidates": [
+          { "pedestal_index": 0, "item_id": 4, "name": "Cricket's Head", "tags": ["damage"], "quality": 3 },
+          { "pedestal_index": 0, "item_id": 2, "name": "The Inner Eye", "tags": ["tear"], "quality": 2 }
+        ],
+        "mod": { "name": "isaac_agent", "version": "0.1.0" }
+      }
+    },
+    "decision.late.json": {
+      "protocol_version": "1.0",
+      "request_id": "r-7f3a-000061",
+      "decision_id": "d-1b2c-000007",
+      "gen_level_key": "f4:r52:treasure:p0:1b2c",
+      "ts": 1793982721800,
+      "error_code": null,
+      "features": [],
+      "requires": [],
+      "valid": true,
+      "decision": {
+        "choice": { "type": "item", "item_id": 2 },
+        "reason": "射速更稳，先补弹幕",
+        "confidence": 0.61,
+        "fallback": false,
+        "source": "llm",
+        "provider_id": "llm:primary",
+        "reason_code": null,
+        "elapsed_ms": 1750
+      }
+    },
+    "applied.json": {
+      "protocol_version": "1.0",
+      "request_id": "r-7f3a-000061",
+      "gen_level_key": "f4:r52:treasure:p0:1b2c",
+      "ts": 1793982721402,
+      "phase": "applied",
+      "decision_id": null,
+      "source": "rule",
+      "provider_id": "rule:local",
+      "fallback": true,
+      "applied_by": "fallback",
+      "error_code": "TIMEOUT",
+      "reason_code": "no_fresh_decision",
+      "choice": { "type": "item", "item_id": 4 },
+      "reason": "本地规则：缺少输出，优先输出类",
+      "latency_ms": null,
+      "pedestal_index": 0,
+      "actual_item_id": 4
+    }
+  },
+  "late_outcome": {
+    "decision_id": "d-1b2c-000007",
+    "received_at_ms": 1810,
+    "result": "discarded",
+    "reason_code": "late",
+    "state_changed": false,
+    "note": "生成/兜底已结束且超过 validity_ms；不补写 applied.json，只在日志留一条 WARN"
+  },
+  "logs": [
+    "INFO plugin/orchestrator request=r-7f3a-000061 provider=llm:primary started budget=1100ms",
+    "WARN mod/generation request=r-7f3a-000061 no eligible decision -> rule:local choice=4 reason_code=no_fresh_decision",
+    "INFO mod/applied request=r-7f3a-000061 applied_by=fallback error_code=TIMEOUT elapsed=none",
+    "WARN mod/decision request=r-7f3a-000061 decision=d-1b2c-000007 discarded reason_code=late received_after_generation=true state_changed=false"
+  ]
+}
