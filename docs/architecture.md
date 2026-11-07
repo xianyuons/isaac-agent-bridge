@@ -1,6 +1,6 @@
-# 架构：分层、接口与扩展点（v1.0-draft.3）
+# 架构：分层、接口与扩展点（v1.0-draft.5）
 
-> 版本：v1.0-draft.3（2026-11-07，t7 评审回写）。协议细节见 [protocol.md](protocol.md) §12 变更记录。
+> 版本：v1.0-draft.5（2026-11-07，t8 Claude 补审 + captain 产品取舍回写）。协议细节见 [protocol.md](protocol.md) §12 变更记录。
 > 配套：[协议](protocol.md)、[代码规范](standards.md)。
 > 目标：把“游戏侧读局面 / 插件侧做决策 / 表现层展示”拆成四层，层与层之间只通过本文列出的接口通信；以后加新玩法（离线小模型、观众投票、地图增强、OBS 叠加）只加实现，不改核心。
 
@@ -12,7 +12,7 @@
    - 协议里的 1500ms 是 **决策有效期/超时判定**，不是 mod 的阻塞等待；
    - mod 必须在生成前 **预取** 决策到内存；回调里只查内存表，不读盘、不调模型、不写盘；
    - 没命中就返回 `nil`（原版）或本地规则结果（必须仍属于候选池），绝不卡帧。
-2. **写盘口要第一天实测。** 参考实现称 Lua 沙箱只有 `Mod:SaveData` 能写盘；本设计把“谁写谁读”拆成三种 Profile（§2），默认目标 Profile A，保底 Profile B。**在实测前，不得把“任意路径原子写”当成既成事实。**
+2. **默认 Profile B，A 是可选高风险项。** 默认不要求玩家改启动项：mod 只读 decision，桥目录写入全在插件；代价是 **没有实时 state、实时 agent 不可用**。要实时 agent 必须用 `--luadebug` 启用 Profile A——那不是“给本 mod 开一个开关”，而是 **给所有 mod 放开文件访问**。Profile C（SaveData 中继）推迟到 v1.1+，v1 不做。**任何契约都不得假设 mod 能写盘。**
 3. **气泡是事后核验。** 气泡在 `POST_PICKUP_INIT`（底座实体初始化）比较“实际生成的 item id”和“决策的 item id”之后再弹，用于解释这次是 llm 还是兜底；不在生成前假装已经生效。
 
 ### 0.1 回调 62 的真实时机（别把“生成”当“玩家拿走”）
@@ -93,29 +93,33 @@ flowchart TB
 
 | 层 | 可以读 | 可以写 | 禁止 |
 | --- | --- | --- | --- |
-| ① 游戏侧 | 游戏 API、`decision.json` | `state.json` / `event.json` / `applied.json`（Profile A/C） | 联网、读 key、调模型、阻塞帧、做帧级输入操作 |
+| ① 游戏侧 | 游戏 API、`decision.json` | `state.json` / `event.json` / `applied.json`（**仅 Profile A**；B 不写） | 联网、读 key、调模型、阻塞帧、做帧级输入操作 |
 | ② 传输层 | 桥目录/管道/端口 | 对应传输介质 | 业务判断、修改文档内容、决定选择 |
-| ③ 决策层 | `state.json` / `event.json` | `decision.json`、`bridge.lock` | 读写 state/event/applied 内容、碰游戏内存、执行模型代码 |
+| ③ 决策层 | `state.json` / `event.json` | `decision.json`、`plugin_status.json`、`bridge.lock` | 读写 state/event/applied 内容、碰游戏内存、执行模型代码 |
 | ④ 表现层 | decision/applied/event 的只读视图 | 自己的输出通道（TTS/弹幕/OBS） | 反向影响决策、阻塞决策路径、失败上报给决策层当错误 |
 
 **依赖方向单向**：① → ② → ③ → ② → ①；④ 只订阅 ③/① 已发布的结果。任何反向调用（例如 Presenter 让 Orchestrator 重选）都必须在架构评审中拒绝。
 
 ---
 
-## 2. 写入模型：三种 Profile
+## 2. 写入模型：默认 B，A 可选，C 推迟到 v1.1+
 
-| | Profile A 双向文件桥（目标） | Profile B 单向只读（保底） | Profile C SaveData 中继（研究） |
+| | Profile B 单向只读（**默认**） | Profile A 双向文件桥（可选） | Profile C SaveData 中继（v1.1+） |
 | --- | --- | --- | --- |
-| 前提 | 探针证明 mod 可读可写 `<bridge>` | mod 只能读 `decision.json` | `Mod:SaveData` 可用，插件侧 feeder 可读存档 |
-| `state/event/applied` 写者 | mod | 无（无法导出） | 插件侧 feeder（内容仍由 mod 生成） |
-| `decision.json` 写者 | 插件 | 插件 | 插件 |
-| 实时 agent | ✅ | ❌（只能预置策略或本地规则） | ⚠️ 取决于 SaveData 可见性，默认关闭 |
-| 失败可见性 | `applied.json` | 气泡 + `Isaac.DebugString` | `applied.json` |
+| 前提 | mod 只读 `decision.json`，**不需要改启动项** | mod 可读可写 `<bridge>`，需要 `--luadebug` 启动 | `Mod:SaveData` + 插件侧 feeder，v1 不做 |
+| `state/event/applied` 写者 | **无**（不导出实时局面） | mod | 插件侧 feeder（内容仍由 mod 生成） |
+| `decision.json` / `plugin_status.json` / `bridge.lock` 写者 | 插件 | 插件 | 插件 |
+| 实时 agent | ❌ 只能预置策略/本地规则，或由外部提供 StateDoc | ✅ | ⚠️ 取决于 SaveData 可见性；v1.1+ 再评估 |
+| 主要风险 | 功能受限，但默认安全 | `--luadebug` **给所有 mod 开文件访问**，不是“本 mod 的开关” | 协议塞存档：类型受限、易与存档机制冲突、审计困难 |
+| 失败可见性 | 气泡 + `Isaac.DebugString` + 插件 `plugin_status.json` | `applied.json` | `applied.json` |
 
-- **启动探针**：mod 在 `on_game_start` 写 `.probe.tmp` → rename → 读回 → 删除；读写分别判定；结果写日志并（可写时）写进 `state.capabilities`。**不得** 在帧回调里做。
-- **Profile B 不假装 agent 可用**：没有素材就只跑本地规则，气泡明确显示“桥接不可用（本地规则）”。
-- **Profile C 的 feeder 只做逐字节中继**：不得修改/补造 state 内容；它是传输层组件，不是决策层。
-- 三种 Profile 的共同点：**`decision.json` 是唯一必需方向，mod 永不阻塞。**
+- **默认是 B，不是 A。** 玩家不改启动项时，mod 只读 decision；桥目录的所有写入（decision/status/lock）由插件完成。B **不导出实时 state**，因此实时 agent 不可用；要么用预置策略/本地规则，要么由外部把完整 StateDoc 交给插件。**不得** 把 B 说成“降级后还能问模型”。
+- **A 是显式可选项。** 需要以 `--luadebug` 启动；代价不是“给这个 mod 开一个开关”，而是 **放开所有 mod 的文件权限**。安全边界见 §9；不接受这个代价的玩家应留在 B。
+- **C 推迟到 v1.1+。** v1 不做 SaveData 中继；理由：把协议塞进存档会遇到数据类型受限、与存档写入/回滚机制冲突、审计困难；等 B/A 的真实使用数据后再设计。
+- **启动探针**：只有尝试 A 时才写 `.probe.tmp` → rename → 读回 → 删除；读写分别判定；结果写日志并（可写时）写进 `state.features`。B 下探针失败是预期，不得在帧回调里做。
+- **契约条件式（硬约束）**：任何地方都 **不得** 假设 mod 能写盘。`state/event/applied` 只有 Profile A 由 mod 写；Profile B 没有这三份文件；Profile C 的 feeder 是 v1.1+ 的传输层组件，v1 不实现。
+- `plugin_status.json` 是插件诊断（protocol §1.11），B/A 都由插件写、mod 只读；它不替代 `applied.json`。
+- 共同点：**`decision.json` 是唯一必需方向，mod 永不阻塞。**
 
 ---
 
@@ -157,6 +161,7 @@ interface GameState {
 
 interface StateDoc {
   protocolVersion: string;
+  sessionId: string;
   requestId: string;
   genLevelKey: string;
   ts: number;
@@ -165,18 +170,20 @@ interface StateDoc {
   reasonCode: string | null;
   features: string[];
   requires: string[];
-  capabilities: string[];
   trigger: Trigger;
   state: GameState;
 }
 
 interface DecisionDoc {
   protocolVersion: string;
+  sessionId: string;
   requestId: string;
   decisionId: string;
   genLevelKey: string;
   ts: number;
   errorCode: ErrorCode | null;
+  features?: string[];
+  requires?: string[];
   valid: boolean;
   decision: {
     choice: Choice;
@@ -192,6 +199,7 @@ interface DecisionDoc {
 
 interface AppliedDoc {
   protocolVersion: string;
+  sessionId: string;
   requestId: string;
   genLevelKey: string;
   ts: number;
@@ -213,7 +221,7 @@ interface AppliedDoc {
 interface VoteTally { itemId: number; votes: number; }
 ```
 
-> 两维拆分：`source` 是 **可靠性维度**（模型产生 / 非模型产生，永久二值）；`providerId` 是 **来源维度**（`llm:primary`、`viewer:bilibili`、`preset:scripted`…）。**禁止** 用 `provider_id` 判断是否兜底；兜底只由 `role`/`fallback`/`applied_by` 决定。校验器必须检查前缀与 `source` 一致（`llm:*` ⇔ `llm`；`rule:*`/`viewer:*`/`preset:*` ⇔ `rule`）。
+> 两维拆分：`source` 是 **可靠性维度**（模型产生 / 非模型产生，永久二值）；`providerId` 是 **来源维度**（`llm:primary`、`viewer:bilibili`、`preset:scripted`…）。**禁止** 用 `provider_id` 判断是否兜底；兜底只由 `role`/`fallback`/`applied_by` 决定。校验器只强制已知前缀与 `source` 一致（`llm:*` ⇔ `llm`；`rule:*`/`viewer:*`/`preset:*` ⇔ `rule`）；未知前缀记 WARN 放行，避免扩展点被校验表锁死。
 
 #### BridgePort（传输层唯一入口）
 
@@ -230,10 +238,21 @@ interface BridgePort {
   readonly kind: "file" | "pipe" | "http" | "ws";
   readState(signal?: AbortSignal): Promise<StateDoc | null>;
   readEvent(signal?: AbortSignal): Promise<GameEvent | null>;
+  readPluginStatus?(): Promise<PluginStatus | null>;
   writeDecision(doc: DecisionDoc): Promise<void>;
   readApplied(signal?: AbortSignal): Promise<AppliedDoc | null>;
   subscribeEvents(handler: (e: GameEvent) => void): () => void;
   health(): Promise<BridgeHealth>;
+}
+
+interface PluginStatus {
+  protocolVersion: string;
+  pluginVersion: string;
+  ts: number;
+  status: "ready" | "degraded" | "refused";
+  errorCode: ErrorCode | null;
+  reasonCode: string | null;
+  detail?: string | null;
 }
 ```
 
@@ -306,6 +325,7 @@ interface DecisionOrchestrator {
 
 ```ts
 interface GameEvent<T = unknown> {
+  sessionId: string;
   type: EventType;
   eventSeq: number;
   requestId?: string;
@@ -319,7 +339,15 @@ interface EventSource {
   start(sink: (event: GameEvent) => void): Promise<void>;
   stop(): Promise<void>;
 }
+
+interface VoteAggregator {
+  ingest(event: GameEvent): void;
+  tally(candidateIds: readonly number[], windowMs: number): VoteTally[];
+  reset(): void;
+}
 ```
+
+> **投票数据链必须闭合**：`BilibiliDanmakuSource` / `ChatSource` 把 `custom` 事件交给 `VoteAggregator`，`VoteAggregator.tally()` 的结果注入 `ProviderContext.votes`；否则 `ViewerVoteProvider` 是一个没有数据来源的假 Provider（见 §4.2 边界）。
 
 #### StateEnricher
 
@@ -344,6 +372,7 @@ interface StateEnricher<T = unknown> {
 - 同名 namespace 冲突 → 后者跳过并告警。
 - **输入边界（重要）**：Enricher 只能看到 `state` / `trigger` / 外部静态数据；它 **不能** 自己读游戏内存。`MapEnricher` 的地图、`EnemyEnricher` 的敌人构成在 v1 的 `GameState` 里没有对应字段，必须先由 mod 通过可选 `state` 字段导出（minor），否则它们只是“看着能插”的占位。`NextFloorPreviewEnricher` 只依赖 `floor` + `items`，v1 就能成立。
 - 接入新 Enricher 时必须在 `requires` 里声明依赖的 state 字段；缺字段时 Enricher **不得** 假装有数据。
+- **可见范围**：Enricher 的输出只进入插件侧 `ProviderContext.enrichments`，**不会** 写回 `state` / `decision`，也不改变 mod 的本地规则（§6.5 只读 state 标签）。因此 Enricher 能影响 llm 的选法，但不能让“两端必须一致”的判定分叉；若要求 mod 也看到，必须走 `state.enrichments` 可选字段 + minor，而不是只加 Enricher。
 
 #### Presenter
 
@@ -506,7 +535,7 @@ class PresetProvider implements DecisionProvider {
 | `GameHookSource` | mod | 把 `MC_POST_NEW_ROOM` / 底座生成 / Boss 出现 / 重掷映射成事件，写 `event.json` |
 | `FileEventSource` | 插件 | 监听/轮询 `event.json`，按 `event_seq` 去重，跳号容忍 |
 | `StateDiffEventSource` | 插件 | 事件文件丢失时的降级：比较前后 state 推导 `room_enter` / `reroll` |
-| `BilibiliDanmakuSource` | 插件 | 接 B 站弹幕中继，归一化为 `custom{name:"bilibili_danmaku"}`；默认关闭 |
+| `BilibiliDanmakuSource` | 插件 | 接 B 站弹幕中继，归一化为 `custom{name:"bilibili_danmaku"}`；经 `VoteAggregator` 汇总后进入 `ProviderContext.votes`；默认关闭 |
 | `ChatSource` | 插件/外部 | 聊天/会话输入归一化为 `custom{name:"chat_message"}`；只做通知/记录，不自动改变决策 |
 | `CustomSource` | 任意 | 其它模组/工具通过 `custom` 注入通知 |
 
@@ -516,13 +545,16 @@ class PresetProvider implements DecisionProvider {
 class FileEventSource implements EventSource {
   readonly id = "file-events";
   readonly types = ["pedestal_spawn", "room_enter", "boss_approach", "reroll", "custom"] as const;
+  private lastSession = "";
   private lastSeq = 0;
   private timer?: NodeJS.Timeout;
   constructor(private readonly port: BridgePort, private readonly log: Logger) {}
   async start(sink: (e: GameEvent) => void) {
     this.timer = setInterval(async () => {
       const e = await this.port.readEvent();
-      if (!e || e.eventSeq <= this.lastSeq) return;
+      if (!e) return;
+      if (e.sessionId !== this.lastSession) { this.lastSession = e.sessionId; this.lastSeq = 0; }
+      if (e.eventSeq <= this.lastSeq) return;
       if (e.eventSeq > this.lastSeq + 1) this.log.warn("event gap", { from: this.lastSeq, to: e.eventSeq });
       this.lastSeq = e.eventSeq;
       sink(e);
@@ -737,6 +769,7 @@ sequenceDiagram
 - **不读 key**：mod 永不接触 key；插件不把 key 写进协议、日志、气泡、`reason`、`provider_id`。
 - **不做帧级操作**：不注入输入、不改内存、不逐帧脚本化玩家行为；只读状态 + 官方 API 在生效点替换/生成道具。
 - **不碰账号凭证**：不读 Steam 账号/token/存档账号数据；协议无账号字段。
+- **默认不放宽 mod 文件权限**：Profile B 下 mod 不写盘；只有玩家显式使用 `--luadebug` 才启用 Profile A。必须原样告知：`--luadebug` 不是“给本 mod 开一个开关”，而是 **给所有 mod 放开文件访问**；不能把它包装成普通功能开关。
 - **不执行模型/观众输出**：输出只作为校验后的数据；不执行代码、不接受模型指定路径。
 - **不做参考实现的过设计**：不引入 16 池 / 160 候选目录 / 多层水位；v1 一次请求一个生成目标（底座或道具池）、候选 ≤64、缓存只按 `gen_level_key` 保留少量条目。
 - **不保证事件必达**：file 模式事件可丢；决策正确性以 state 为准。
@@ -747,7 +780,7 @@ sequenceDiagram
 
 ```
 isaac-agent/
-├─ lua/                 # mod：state 导出、decision 消费、本地规则、气泡；内含 tests/
+├─ mods/<mod名>/         # mod：state 导出、decision 消费、本地规则、气泡；内含 tests/（游戏要求此布局）
 ├─ dsh/                 # DSH 插件：BridgePort、Orchestrator、Providers、Enrichers、Presenters；内含 tests/
 ├─ python/              # 可选 sidecar/feeder/弹幕模拟/离线工具；内含 tests/
 ├─ protocol/            # 协议样例与固定快照（examples/）、契约夹具
